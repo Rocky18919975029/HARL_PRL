@@ -1,7 +1,10 @@
+# harl/algorithms/actors/happo.py
+
 """HAPPO algorithm."""
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from harl.utils.envs_tools import check
 from harl.utils.models_tools import get_grad_norm
 from harl.algorithms.actors.on_policy_base import OnPolicyBase
@@ -24,16 +27,23 @@ class HAPPO(OnPolicyBase):
         self.entropy_coef = args["entropy_coef"]
         self.use_max_grad_norm = args["use_max_grad_norm"]
         self.max_grad_norm = args["max_grad_norm"]
+        
+        # === 【新增代码：辅助损失系数】 ===
+        # 推荐在 yaml 配置文件中增加 aux_loss_coef 参数，如果没有配置，则默认 1.0
+        self.aux_loss_coef = args.get("aux_loss_coef", 1.0)
 
-    def update(self, sample):
+    # === 【修改签名：新增 target_embedding 参数】 ===
+    def update(self, sample, target_embedding=None, target_joint_actions=None):
         """Update actor network.
         Args:
             sample: (Tuple) contains data batch with which to update networks.
+            target_embedding: (torch.Tensor, optional) Target embedding from Critic for aux loss.
         Returns:
             policy_loss: (torch.Tensor) actor(policy) loss value.
             dist_entropy: (torch.Tensor) action entropies.
             actor_grad_norm: (torch.Tensor) gradient norm from actor update.
             imp_weights: (torch.Tensor) importance sampling weights.
+            aux_loss: (torch.Tensor) auxiliary prediction loss.
         """
         (
             obs_batch,
@@ -51,15 +61,22 @@ class HAPPO(OnPolicyBase):
         adv_targ = check(adv_targ).to(**self.tpdv)
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
         factor_batch = check(factor_batch).to(**self.tpdv)
+        
+        # 如果传入了 target_embedding，将它移到指定设备并 detach，防止影响 critic
+        if target_embedding is not None:
+            target_embedding = check(target_embedding).to(**self.tpdv).detach()
 
         # Reshape to do evaluations for all steps in a single forward pass
-        action_log_probs, dist_entropy, _ = self.evaluate_actions(
+        # === 【修改代码：直接调用 actor 以获取 predicted_embedding】 ===
+        action_log_probs, dist_entropy, _, predicted_embedding, predicted_joint_actions = self.actor.evaluate_actions(
             obs_batch,
             rnn_states_batch,
             actions_batch,
             masks_batch,
             available_actions_batch,
             active_masks_batch,
+            return_aux=True, 
+            return_action_pred=True # 打开两个开关
         )
 
         # actor update
@@ -84,11 +101,31 @@ class HAPPO(OnPolicyBase):
                 factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True
             ).mean()
 
-        policy_loss = policy_action_loss
+        # === 【新增代码：计算辅助的 MSE 损失】 ===
+        aux_loss = torch.tensor(0.0).to(**self.tpdv)
+        if target_embedding is not None:
+            # 也可以在这里对 active_masks_batch 掩码过滤，防止 padding 数据产生干扰
+            # 简单起见，这里直接算 MSE
+            aux_loss = F.mse_loss(predicted_embedding, target_embedding)
+
+        # === 【增量修改 9】：计算动作预测 MSE 损失 ===
+        action_pred_loss = torch.tensor(0.0).to(**self.tpdv)
+        if target_joint_actions is not None:
+            # 同样可以用 active_masks_batch 进行过滤
+            if self.use_policy_active_masks:
+                unreduced_mse = F.mse_loss(predicted_joint_actions, target_joint_actions.detach(), reduction='none')
+                unreduced_mse = unreduced_mse.mean(dim=-1, keepdim=True)
+                action_pred_loss = (unreduced_mse * active_masks_batch).sum() / active_masks_batch.sum()
+            else:
+                action_pred_loss = F.mse_loss(predicted_joint_actions, target_joint_actions.detach())
+
+        action_pred_coef = self.args.get("action_pred_coef", 1.0)
+        
+        loss = policy_action_loss - dist_entropy * self.entropy_coef + aux_loss * self.aux_loss_coef + action_pred_loss * action_pred_coef
 
         self.actor_optimizer.zero_grad()
 
-        (policy_loss - dist_entropy * self.entropy_coef).backward()  # add entropy term
+        loss.backward()
 
         if self.use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(
@@ -99,22 +136,27 @@ class HAPPO(OnPolicyBase):
 
         self.actor_optimizer.step()
 
-        return policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        return policy_action_loss, dist_entropy, actor_grad_norm, imp_weights, aux_loss, action_pred_loss
 
+    # === 【注意：这里的 train 方法我们将不再使用，或者需要剥离到 runner 里】 ===
+    # HARL 的设计中，原代码的 `train()` 在 runner 里被调用。
+    # 因为我们要在这里获取 target_embedding，所以我们把 get target embedding 的逻辑，
+    # 连同对 data_generator 的迭代，搬回到 Runner 中更为合理。
+    # 为了保证原有代码结构不破坏，我保留该 train 并在内部支持 target_embedding=None 的 fallback。
+    # 但实际训练时，我们需要在 runner.py 里修改成：不调这个 train()，而是手动写这个循环，以便传 target_embedding。
     def train(self, actor_buffer, advantages, state_type):
-        """Perform a training update using minibatch GD.
-        Args:
-            actor_buffer: (OnPolicyActorBuffer) buffer containing training data related to actor.
-            advantages: (np.ndarray) advantages.
-            state_type: (str) type of state.
-        Returns:
-            train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
+        """
+        [NOTE]: This method is kept for compatibility. 
+        However, to pass 'target_embedding', we highly recommend 
+        writing the mini-batch loop directly in the Runner 
+        and calling `self.update(sample, target_embedding)`.
         """
         train_info = {}
         train_info["policy_loss"] = 0
         train_info["dist_entropy"] = 0
         train_info["actor_grad_norm"] = 0
         train_info["ratio"] = 0
+        train_info["aux_loss"] = 0
 
         if np.all(actor_buffer.active_masks[:-1] == 0.0):
             return train_info
@@ -141,14 +183,18 @@ class HAPPO(OnPolicyBase):
                 )
 
             for sample in data_generator:
-                policy_loss, dist_entropy, actor_grad_norm, imp_weights = self.update(
-                    sample
+                # === 【修复 2】：接收 action_pred_loss 以匹配 update 的返回值 ===
+                policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_loss, action_pred_loss = self.update(
+                    sample, target_embedding=None, target_joint_actions=None
                 )
 
                 train_info["policy_loss"] += policy_loss.item()
                 train_info["dist_entropy"] += dist_entropy.item()
                 train_info["actor_grad_norm"] += actor_grad_norm
                 train_info["ratio"] += imp_weights.mean()
+                train_info["aux_loss"] += aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss
+                # 虽然不用，但安全起见可以存一下
+                train_info["action_pred_loss"] = train_info.get("action_pred_loss", 0) + (action_pred_loss.item() if isinstance(action_pred_loss, torch.Tensor) else action_pred_loss)
 
         num_updates = self.ppo_epoch * self.actor_num_mini_batch
 

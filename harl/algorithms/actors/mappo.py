@@ -52,7 +52,8 @@ class MAPPO(OnPolicyBase):
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
 
         # reshape to do in a single forward pass for all steps
-        action_log_probs, dist_entropy, _ = self.evaluate_actions(
+        # === 【修复】：多接收一个返回值 predicted_embedding ===
+        action_log_probs, dist_entropy, _, predicted_embedding = self.evaluate_actions(
             obs_batch,
             rnn_states_batch,
             actions_batch,

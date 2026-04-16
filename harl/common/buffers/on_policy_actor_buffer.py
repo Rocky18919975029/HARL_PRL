@@ -1,3 +1,5 @@
+# harl/common/buffers/on_policy_actor_buffer.py
+
 """On-policy buffer for actor."""
 
 import torch
@@ -112,7 +114,7 @@ class OnPolicyActorBuffer:
             self.available_actions[0] = self.available_actions[-1].copy()
 
     def feed_forward_generator_actor(
-        self, advantages, actor_num_mini_batch=None, mini_batch_size=None
+        self, advantages, actor_num_mini_batch=None, mini_batch_size=None, share_obs=None, joint_actions=None
     ):
         """Training data generator for actor that uses MLP network."""
 
@@ -134,10 +136,6 @@ class OnPolicyActorBuffer:
             for i in range(actor_num_mini_batch)
         ]
 
-        # Combine the first two dimensions (episode_length and n_rollout_threads) to form batch.
-        # Take obs shape as an example: 
-        # (episode_length + 1, n_rollout_threads, *obs_shape) --> (episode_length, n_rollout_threads, *obs_shape)
-        # --> (episode_length * n_rollout_threads, *obs_shape)
         obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
         rnn_states = self.rnn_states[:-1].reshape(-1, *self.rnn_states.shape[2:])  # actually not used, just for consistency
         actions = self.actions.reshape(-1, self.actions.shape[-1])
@@ -151,11 +149,16 @@ class OnPolicyActorBuffer:
         if self.factor is not None:
             factor = self.factor.reshape(-1, self.factor.shape[-1])
         advantages = advantages.reshape(-1, 1)
-
         
+        # === 【新增代码：提取 next_share_obs】 ===
+        if share_obs is not None:
+            # 取 1 到 最后，即为 t+1 时刻的全局状态
+            next_share_obs = share_obs[1:].reshape(-1, *share_obs.shape[2:])
+        # === 【增量修改 5】：展平动作 ===
+        if joint_actions is not None:
+            # joint_actions 是从 actions 拼装来的，长度正好等于 episode_length，【不需要切片】
+            flat_joint_actions = joint_actions.reshape(-1, joint_actions.shape[-1])
         for indices in sampler:
-            # obs shape: 
-            # (episode_length * n_rollout_threads, *obs_shape) --> (mini_batch_size, *obs_shape)
             obs_batch = obs[indices]
             rnn_states_batch = rnn_states[indices]
             actions_batch = actions[indices]
@@ -171,13 +174,25 @@ class OnPolicyActorBuffer:
             else:
                 adv_targ = advantages[indices]
 
-            if self.factor is None:
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
-            else:
-                factor_batch = factor[indices]
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch
+            yield_tuple = (
+                obs_batch, rnn_states_batch, actions_batch, masks_batch, 
+                active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+            )
+            
+            if self.factor is not None:
+                yield_tuple += (factor[indices],)
+                
+            # === 【新增代码：将 next_share_obs 塞进 yield 的结尾】 ===
+            if share_obs is not None:
+                yield_tuple += (next_share_obs[indices],)
 
-    def naive_recurrent_generator_actor(self, advantages, actor_num_mini_batch):
+            # === 【增量修改 6】：挂载在元组最后 ===
+            if joint_actions is not None:
+                yield_tuple += (flat_joint_actions[indices],)
+
+            yield yield_tuple
+
+    def naive_recurrent_generator_actor(self, advantages, actor_num_mini_batch, share_obs=None, joint_actions=None):
         """Training data generator for actor that uses RNN network.
         This generator does not split the trajectories into chunks, 
         and therefore maybe less efficient than the recurrent_generator_actor in training.
@@ -211,16 +226,30 @@ class OnPolicyActorBuffer:
                 available_actions_batch = _flatten(T, N, self.available_actions[:-1, ids])
             else:
                 available_actions_batch = None
-            if self.factor is not None:
-                factor_batch = _flatten(T, N, self.factor[:, ids])
             rnn_states_batch = self.rnn_states[0, ids]
             
-            if self.factor is not None:
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch
-            else:
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+            yield_tuple = (
+                obs_batch, rnn_states_batch, actions_batch, masks_batch, 
+                active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+            )
 
-    def recurrent_generator_actor(self, advantages, actor_num_mini_batch, data_chunk_length):
+            if self.factor is not None:
+                factor_batch = _flatten(T, N, self.factor[:, ids])
+                yield_tuple += (factor_batch,)
+
+            if share_obs is not None:
+                next_share_obs_batch = _flatten(T, N, share_obs[1:, ids])
+                yield_tuple += (next_share_obs_batch,)
+                
+            # === 【新增代码：追加 joint_actions 到元组最末尾】 ===
+            if joint_actions is not None:
+                # joint_actions 是从各 actor 的 actions 拼来的，第一维本身就是 episode_length，不需要 [:-1]
+                joint_actions_batch = _flatten(T, N, joint_actions[:, ids])
+                yield_tuple += (joint_actions_batch,)
+
+            yield yield_tuple
+
+    def recurrent_generator_actor(self, advantages, actor_num_mini_batch, data_chunk_length, share_obs=None, joint_actions=None):
         """Training data generator for actor that uses RNN network.
         This generator splits the trajectories into chunks of length data_chunk_length, 
         and therefore maybe more efficient than the naive_recurrent_generator_actor in training.
@@ -244,11 +273,6 @@ class OnPolicyActorBuffer:
             for i in range(actor_num_mini_batch)
         ]
 
-        # The following data operations first transpose the first two dimensions of the data (episode_length, n_rollout_threads)
-        # to (n_rollout_threads, episode_length), then reshape the data to (n_rollout_threads * episode_length, *dim).
-        # Take obs shape as an example:
-        # (episode_length + 1, n_rollout_threads, *obs_shape) --> (episode_length, n_rollout_threads, *obs_shape)
-        # --> (n_rollout_threads, episode_length, *obs_shape) --> (n_rollout_threads * episode_length, *obs_shape)
         if len(self.obs.shape) > 3:
             obs = self.obs[:-1].transpose(1, 0, 2, 3, 4).reshape(-1, *self.obs.shape[2:])
         else:
@@ -266,6 +290,16 @@ class OnPolicyActorBuffer:
         if self.available_actions is not None:
             available_actions = _sa_cast(self.available_actions[:-1])
 
+        if share_obs is not None:
+            if len(share_obs.shape) > 3:
+                next_share_obs = share_obs[1:].transpose(1, 0, 2, 3, 4).reshape(-1, *share_obs.shape[2:])
+            else:
+                next_share_obs = _sa_cast(share_obs[1:])
+                
+        # === 【新增代码：预处理 joint_actions】 ===
+        if joint_actions is not None:
+            joint_actions = _sa_cast(joint_actions)
+
         # generate mini-batches
         for indices in sampler:
             obs_batch = []
@@ -277,6 +311,10 @@ class OnPolicyActorBuffer:
             old_action_log_probs_batch = []
             adv_targ = []
             factor_batch = []
+            
+            next_share_obs_batch = [] if share_obs is not None else None
+            # === 【新增代码】 ===
+            joint_actions_batch = [] if joint_actions is not None else None
 
             for index in indices:
                 ind = index * data_chunk_length
@@ -291,6 +329,13 @@ class OnPolicyActorBuffer:
                 rnn_states_batch.append(rnn_states[ind])  # only the beginning rnn states are needed
                 if self.factor is not None:
                     factor_batch.append(factor[ind : ind + data_chunk_length])
+                    
+                if share_obs is not None:
+                    next_share_obs_batch.append(next_share_obs[ind : ind + data_chunk_length])
+                    
+                # === 【新增代码】 ===
+                if joint_actions is not None:
+                    joint_actions_batch.append(joint_actions[ind : ind + data_chunk_length])
             
             L, N = data_chunk_length, mini_batch_size
             # These are all ndarrays of size (data_chunk_length, mini_batch_size, *dim)
@@ -306,6 +351,13 @@ class OnPolicyActorBuffer:
             adv_targ = np.stack(adv_targ, axis=1)
             # rnn_states_batch is a (mini_batch_size, *dim) ndarray
             rnn_states_batch = np.stack(rnn_states_batch).reshape(N, *self.rnn_states.shape[2:])
+            
+            if share_obs is not None:
+                next_share_obs_batch = np.stack(next_share_obs_batch, axis=1)
+                
+            # === 【新增代码】 ===
+            if joint_actions is not None:
+                joint_actions_batch = np.stack(joint_actions_batch, axis=1)
 
             # flatten the (data_chunk_length, mini_batch_size, *dim) ndarrays to (data_chunk_length * mini_batch_size, *dim)
             obs_batch = _flatten(L, N, obs_batch)
@@ -320,7 +372,27 @@ class OnPolicyActorBuffer:
             active_masks_batch = _flatten(L, N, active_masks_batch)
             old_action_log_probs_batch = _flatten(L, N, old_action_log_probs_batch)
             adv_targ = _flatten(L, N, adv_targ)
+            
+            if share_obs is not None:
+                next_share_obs_batch = _flatten(L, N, next_share_obs_batch)
+                
+            # === 【新增代码】 ===
+            if joint_actions is not None:
+                joint_actions_batch = _flatten(L, N, joint_actions_batch)
+
+            yield_tuple = (
+                obs_batch, rnn_states_batch, actions_batch, masks_batch, 
+                active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+            )
+            
             if self.factor is not None:
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch
-            else:
-                yield obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+                yield_tuple += (factor_batch,)
+                
+            if share_obs is not None:
+                yield_tuple += (next_share_obs_batch,)
+                
+            # === 【新增代码：追加 joint_actions 到元组最末尾】 ===
+            if joint_actions is not None:
+                yield_tuple += (joint_actions_batch,)
+
+            yield yield_tuple

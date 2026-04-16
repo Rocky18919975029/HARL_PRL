@@ -1,3 +1,5 @@
+# harl/models/value_function_models/v_net.py
+
 import torch
 import torch.nn as nn
 from harl.models.base.cnn import CNNBase
@@ -65,3 +67,36 @@ class VNet(nn.Module):
         values = self.v_out(critic_features)
 
         return values, rnn_states
+
+    def get_embedding(self, cent_obs, rnn_states, masks):
+        """Get the state embedding from the critic network for the auxiliary task.
+        Args:
+            cent_obs: (np.ndarray / torch.Tensor) observation inputs into network.
+            rnn_states: (np.ndarray / torch.Tensor) if RNN network, hidden states for RNN.
+            masks: (np.ndarray / torch.Tensor) mask tensor denoting if RNN states should be reinitialized to zeros.
+        Returns:
+            critic_features: (torch.Tensor) extracted state embedding before value projection.
+        """
+        cent_obs = check(cent_obs).to(**self.tpdv)
+        # rnn_states = check(rnn_states).to(**self.tpdv)
+        # masks = check(masks).to(**self.tpdv)
+
+        # 仅提取基础网络 (CNN/MLP/DeepResNet) 的纯空间特征 (Spatial Features)
+        critic_features = self.base(cent_obs)
+        
+        # =========================================================================
+        # === 【核心修复：阻断特征污染】 ===
+        # 在计算 Aux Loss 时，Actor 是用自己带有记忆 (RNN) 的特征，
+        # 去预测 Critic 视角的全局特征。
+        # 
+        # 如果在这里让 Critic_features 经过 RNN，由于我们在 Runner 中提供的是 
+        # 全 0 的假记忆 (dummy_rnn_states)，Critic 会输出一个被严重污染的 Target。
+        # 这将导致 Actor 学到错误的表征，一旦开启 Condition 就会导致策略崩溃。
+        #
+        # 因此，这里强制跳过 Critic 的 RNN 层，让目标特征回归为纯粹的、无状态的“全局快照”。
+        # =========================================================================
+        
+        # if self.use_naive_recurrent_policy or self.use_recurrent_policy:
+        #     critic_features, _ = self.rnn(critic_features, rnn_states, masks)
+            
+        return critic_features

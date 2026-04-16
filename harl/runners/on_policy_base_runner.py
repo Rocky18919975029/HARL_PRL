@@ -1,9 +1,13 @@
+# harl/runners/on_policy_base_runner.py
+
 """Base runner for on-policy algorithms."""
 
 import time
+import os
 import numpy as np
 import torch
 import setproctitle
+from tqdm import tqdm  # ===【新增】: 进度条
 from harl.common.valuenorm import ValueNorm
 from harl.common.buffers.on_policy_actor_buffer import OnPolicyActorBuffer
 from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferEP
@@ -93,6 +97,10 @@ class OnPolicyBaseRunner:
         print("observation_space: ", self.envs.observation_space)
         print("action_space: ", self.envs.action_space)
 
+        # === 【增量修改 1】：计算全局动作空间总维度，供 Action Pred Head 使用 ===
+        from harl.utils.envs_tools import get_shape_from_act_space
+        total_action_dim = sum([get_shape_from_act_space(self.envs.action_space[i]) for i in range(self.num_agents)])
+        algo_args["algo"]["total_action_dim"] = total_action_dim
         # actor
         if self.share_param:
             self.actor = []
@@ -140,15 +148,11 @@ class OnPolicyBaseRunner:
                 device=self.device,
             )
             if self.state_type == "EP":
-                # EP stands for Environment Provided, as phrased by MAPPO paper.
-                # In EP, the global states for all agents are the same.
                 self.critic_buffer = OnPolicyCriticBufferEP(
                     {**algo_args["train"], **algo_args["model"], **algo_args["algo"]},
                     share_observation_space,
                 )
             elif self.state_type == "FP":
-                # FP stands for Feature Pruned, as phrased by MAPPO paper.
-                # In FP, the global states for all agents are different, and thus needs the dimension of the number of agents.
                 self.critic_buffer = OnPolicyCriticBufferFP(
                     {**algo_args["train"], **algo_args["model"], **algo_args["algo"]},
                     share_observation_space,
@@ -165,6 +169,9 @@ class OnPolicyBaseRunner:
             self.logger = LOGGER_REGISTRY[args["env"]](
                 args, algo_args, env_args, self.num_agents, self.writter, self.run_dir
             )
+            
+        # === 【新增】：断点重续的全局起始 episode ===
+        self.start_episode = 1
         if self.algo_args["train"]["model_dir"] is not None:  # restore model
             self.restore()
 
@@ -184,7 +191,10 @@ class OnPolicyBaseRunner:
 
         self.logger.init(episodes)  # logger callback at the beginning of training
 
-        for episode in range(1, episodes + 1):
+        # ===【新增】: 进度条 (从 start_episode 到 episodes) ===
+        pbar = tqdm(total=episodes, initial=self.start_episode - 1, desc="Training")
+
+        for episode in range(self.start_episode, episodes + 1):
             if self.algo_args["train"][
                 "use_linear_lr_decay"
             ]:  # linear decay of learning rate
@@ -195,9 +205,7 @@ class OnPolicyBaseRunner:
                         self.actor[agent_id].lr_decay(episode, episodes)
                 self.critic.lr_decay(episode, episodes)
 
-            self.logger.episode_init(
-                episode
-            )  # logger callback at the beginning of each episode
+            self.logger.episode_init(episode)  # logger callback at the beginning of each episode
 
             self.prep_rollout()  # change to eval mode
             for step in range(self.algo_args["train"]["episode_length"]):
@@ -218,12 +226,6 @@ class OnPolicyBaseRunner:
                     infos,
                     available_actions,
                 ) = self.envs.step(actions)
-                # obs: (n_threads, n_agents, obs_dim)
-                # share_obs: (n_threads, n_agents, share_obs_dim)
-                # rewards: (n_threads, n_agents, 1)
-                # dones: (n_threads, n_agents)
-                # infos: (n_threads)
-                # available_actions: (n_threads, ) of None or (n_threads, n_agents, action_number)
                 data = (
                     obs,
                     share_obs,
@@ -239,7 +241,6 @@ class OnPolicyBaseRunner:
                 )
 
                 self.logger.per_step(data)  # logger callback at each step
-
                 self.insert(data)  # insert data into buffer
 
             # compute return and update network
@@ -248,7 +249,44 @@ class OnPolicyBaseRunner:
 
             actor_train_infos, critic_train_info = self.train()
 
-            # log information
+            # ===【修改】: 收集并打印 Aux Loss 和 Act Pred Loss ===
+            # 由于存在多个 agent，我们取平均值来展示
+            aux_losses = []
+            action_pred_losses = []
+            
+            for agent_id in range(self.num_agents):
+                # 收集 aux_loss
+                if "aux_loss" in actor_train_infos[agent_id]:
+                    aux_losses.append(actor_train_infos[agent_id]["aux_loss"])
+                # 收集 action_pred_loss
+                if "action_pred_loss" in actor_train_infos[agent_id]:
+                    action_pred_losses.append(actor_train_infos[agent_id]["action_pred_loss"])
+            
+            pbar_postfix = {}
+            # 计算当前的全局步数：episode * episode_length * n_rollout_threads
+            current_steps = (
+                episode 
+                * self.algo_args["train"]["episode_length"] 
+                * self.algo_args["train"]["n_rollout_threads"]
+            )
+
+            # 处理 Aux Loss
+            if len(aux_losses) > 0 and np.mean(aux_losses) != 0.0:
+                avg_aux_loss = np.mean(aux_losses)
+                pbar_postfix["Aux Loss"] = f"{avg_aux_loss:.4f}"
+                self.writter.add_scalar("avg_aux_loss", avg_aux_loss, current_steps)
+                
+            # 处理 Action Pred Loss
+            if len(action_pred_losses) > 0 and np.mean(action_pred_losses) != 0.0:
+                avg_act_pred_loss = np.mean(action_pred_losses)
+                pbar_postfix["Act Pred"] = f"{avg_act_pred_loss:.4f}"
+                self.writter.add_scalar("avg_action_pred_loss", avg_act_pred_loss, current_steps)
+
+            # 更新 tqdm 进度条的后缀显示
+            if pbar_postfix:
+                pbar.set_postfix(pbar_postfix)
+
+            # log information (将打印到 Tensorboard 等)
             if episode % self.algo_args["train"]["log_interval"] == 0:
                 self.logger.episode_log(
                     actor_train_infos,
@@ -262,9 +300,23 @@ class OnPolicyBaseRunner:
                 if self.algo_args["eval"]["use_eval"]:
                     self.prep_rollout()
                     self.eval()
-                self.save()
+            
+            # === 【修复】：将保存逻辑独立出来 ===
+            # 如果满足 eval_interval，或者满足 save_backup_interval，就调用 save
+            save_backup_interval = self.algo_args["train"].get("save_backup_interval", 100)
+            if (episode % self.algo_args["train"]["eval_interval"] == 0) or \
+               (episode % save_backup_interval == 0):
+                self.save(episode)
 
             self.after_update()
+            
+            # ===【新增】: 进度条步进 ===
+            pbar.update(1)
+            
+            # ===【新增】: 进度条步进 ===
+            pbar.update(1)
+
+        pbar.close()
 
     def warmup(self):
         """Warm up the replay buffer."""
@@ -284,13 +336,7 @@ class OnPolicyBaseRunner:
 
     @torch.no_grad()
     def collect(self, step):
-        """Collect actions and values from actors and critics.
-        Args:
-            step: step in the episode.
-        Returns:
-            values, actions, action_log_probs, rnn_states, rnn_states_critic
-        """
-        # collect actions, action_log_probs, rnn_states from n actors
+        """Collect actions and values from actors and critics."""
         action_collector = []
         action_log_prob_collector = []
         rnn_state_collector = []
@@ -306,19 +352,16 @@ class OnPolicyBaseRunner:
             action_collector.append(_t2n(action))
             action_log_prob_collector.append(_t2n(action_log_prob))
             rnn_state_collector.append(_t2n(rnn_state))
-        # (n_agents, n_threads, dim) -> (n_threads, n_agents, dim)
         actions = np.array(action_collector).transpose(1, 0, 2)
         action_log_probs = np.array(action_log_prob_collector).transpose(1, 0, 2)
         rnn_states = np.array(rnn_state_collector).transpose(1, 0, 2, 3)
 
-        # collect values, rnn_states_critic from 1 critic
         if self.state_type == "EP":
             value, rnn_state_critic = self.critic.get_values(
                 self.critic_buffer.share_obs[step],
                 self.critic_buffer.rnn_states_critic[step],
                 self.critic_buffer.masks[step],
             )
-            # (n_threads, dim)
             values = _t2n(value)
             rnn_states_critic = _t2n(rnn_state_critic)
         elif self.state_type == "FP":
@@ -326,8 +369,7 @@ class OnPolicyBaseRunner:
                 np.concatenate(self.critic_buffer.share_obs[step]),
                 np.concatenate(self.critic_buffer.rnn_states_critic[step]),
                 np.concatenate(self.critic_buffer.masks[step]),
-            )  # concatenate (n_threads, n_agents, dim) into (n_threads * n_agents, dim)
-            # split (n_threads * n_agents, dim) into (n_threads, n_agents, dim)
+            )
             values = np.array(
                 np.split(_t2n(value), self.algo_args["train"]["n_rollout_threads"])
             )
@@ -342,94 +384,38 @@ class OnPolicyBaseRunner:
     def insert(self, data):
         """Insert data into buffer."""
         (
-            obs,  # (n_threads, n_agents, obs_dim)
-            share_obs,  # (n_threads, n_agents, share_obs_dim)
-            rewards,  # (n_threads, n_agents, 1)
-            dones,  # (n_threads, n_agents)
-            infos,  # type: list, shape: (n_threads, n_agents)
-            available_actions,  # (n_threads, ) of None or (n_threads, n_agents, action_number)
-            values,  # EP: (n_threads, dim), FP: (n_threads, n_agents, dim)
-            actions,  # (n_threads, n_agents, action_dim)
-            action_log_probs,  # (n_threads, n_agents, action_dim)
-            rnn_states,  # (n_threads, n_agents, dim)
-            rnn_states_critic,  # EP: (n_threads, dim), FP: (n_threads, n_agents, dim)
+            obs, share_obs, rewards, dones, infos, available_actions,
+            values, actions, action_log_probs, rnn_states, rnn_states_critic,
         ) = data
 
-        dones_env = np.all(dones, axis=1)  # if all agents are done, then env is done
-        rnn_states[
-            dones_env == True
-        ] = np.zeros(  # if env is done, then reset rnn_state to all zero
-            (
-                (dones_env == True).sum(),
-                self.num_agents,
-                self.recurrent_n,
-                self.rnn_hidden_size,
-            ),
-            dtype=np.float32,
+        dones_env = np.all(dones, axis=1)
+        rnn_states[dones_env == True] = np.zeros(
+            ((dones_env == True).sum(), self.num_agents, self.recurrent_n, self.rnn_hidden_size,), dtype=np.float32,
         )
 
-        # If env is done, then reset rnn_state_critic to all zero
         if self.state_type == "EP":
             rnn_states_critic[dones_env == True] = np.zeros(
-                ((dones_env == True).sum(), self.recurrent_n, self.rnn_hidden_size),
-                dtype=np.float32,
+                ((dones_env == True).sum(), self.recurrent_n, self.rnn_hidden_size), dtype=np.float32,
             )
         elif self.state_type == "FP":
             rnn_states_critic[dones_env == True] = np.zeros(
-                (
-                    (dones_env == True).sum(),
-                    self.num_agents,
-                    self.recurrent_n,
-                    self.rnn_hidden_size,
-                ),
-                dtype=np.float32,
+                ((dones_env == True).sum(), self.num_agents, self.recurrent_n, self.rnn_hidden_size,), dtype=np.float32,
             )
 
-        # masks use 0 to mask out threads that just finish.
-        # this is used for denoting at which point should rnn state be reset
-        masks = np.ones(
-            (self.algo_args["train"]["n_rollout_threads"], self.num_agents, 1),
-            dtype=np.float32,
-        )
-        masks[dones_env == True] = np.zeros(
-            ((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32
-        )
+        masks = np.ones((self.algo_args["train"]["n_rollout_threads"], self.num_agents, 1), dtype=np.float32,)
+        masks[dones_env == True] = np.zeros(((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32)
 
-        # active_masks use 0 to mask out agents that have died
-        active_masks = np.ones(
-            (self.algo_args["train"]["n_rollout_threads"], self.num_agents, 1),
-            dtype=np.float32,
-        )
-        active_masks[dones == True] = np.zeros(
-            ((dones == True).sum(), 1), dtype=np.float32
-        )
-        active_masks[dones_env == True] = np.ones(
-            ((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32
-        )
+        active_masks = np.ones((self.algo_args["train"]["n_rollout_threads"], self.num_agents, 1), dtype=np.float32,)
+        active_masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+        active_masks[dones_env == True] = np.ones(((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32)
 
-        # bad_masks use 0 to denote truncation and 1 to denote termination
         if self.state_type == "EP":
             bad_masks = np.array(
-                [
-                    [0.0]
-                    if "bad_transition" in info[0].keys()
-                    and info[0]["bad_transition"] == True
-                    else [1.0]
-                    for info in infos
-                ]
+                [[0.0] if "bad_transition" in info[0].keys() and info[0]["bad_transition"] == True else [1.0] for info in infos]
             )
         elif self.state_type == "FP":
             bad_masks = np.array(
-                [
-                    [
-                        [0.0]
-                        if "bad_transition" in info[agent_id].keys()
-                        and info[agent_id]["bad_transition"] == True
-                        else [1.0]
-                        for agent_id in range(self.num_agents)
-                    ]
-                    for info in infos
-                ]
+                [[[0.0] if "bad_transition" in info[agent_id].keys() and info[agent_id]["bad_transition"] == True else [1.0] for agent_id in range(self.num_agents)] for info in infos]
             )
 
         for agent_id in range(self.num_agents):
@@ -440,19 +426,12 @@ class OnPolicyBaseRunner:
                 action_log_probs[:, agent_id],
                 masks[:, agent_id],
                 active_masks[:, agent_id],
-                available_actions[:, agent_id]
-                if available_actions[0] is not None
-                else None,
+                available_actions[:, agent_id] if available_actions[0] is not None else None,
             )
 
         if self.state_type == "EP":
             self.critic_buffer.insert(
-                share_obs[:, 0],
-                rnn_states_critic,
-                values,
-                rewards[:, 0],
-                masks[:, 0],
-                bad_masks,
+                share_obs[:, 0], rnn_states_critic, values, rewards[:, 0], masks[:, 0], bad_masks,
             )
         elif self.state_type == "FP":
             self.critic_buffer.insert(
@@ -461,10 +440,7 @@ class OnPolicyBaseRunner:
 
     @torch.no_grad()
     def compute(self):
-        """Compute returns and advantages.
-        Compute critic evaluation of the last state,
-        and then let buffer compute returns, which will be used during training.
-        """
+        """Compute returns and advantages."""
         if self.state_type == "EP":
             next_value, _ = self.critic.get_values(
                 self.critic_buffer.share_obs[-1],
@@ -478,9 +454,7 @@ class OnPolicyBaseRunner:
                 np.concatenate(self.critic_buffer.rnn_states_critic[-1]),
                 np.concatenate(self.critic_buffer.masks[-1]),
             )
-            next_value = np.array(
-                np.split(_t2n(next_value), self.algo_args["train"]["n_rollout_threads"])
-            )
+            next_value = np.array(np.split(_t2n(next_value), self.algo_args["train"]["n_rollout_threads"]))
         self.critic_buffer.compute_returns(next_value, self.value_normalizer)
 
     def train(self):
@@ -488,10 +462,7 @@ class OnPolicyBaseRunner:
         raise NotImplementedError
 
     def after_update(self):
-        """Do the necessary data operations after an update.
-        After an update, copy the data at the last step to the first position of the buffer.
-        This will be used for then generating new actions.
-        """
+        """Do the necessary data operations after an update."""
         for agent_id in range(self.num_agents):
             self.actor_buffer[agent_id].after_update()
         self.critic_buffer.after_update()
@@ -709,29 +680,61 @@ class OnPolicyBaseRunner:
             else:
                 self.envs.save_replay()
 
+    # === 【找回的方法：准备推断/评估】 ===
     def prep_rollout(self):
         """Prepare for rollout."""
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_rollout()
         self.critic.prep_rollout()
 
+    # === 【找回的方法：准备训练】 ===
     def prep_training(self):
         """Prepare for training."""
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_training()
         self.critic.prep_training()
 
-    def save(self):
-        """Save model parameters."""
+    # === 【新重构的保存方法】 ===
+    def save(self, episode=None):
+        """Save model parameters.
+        Args:
+            episode (int): 当前的 episode，用于生成 backup 模型和记录进度
+        """
+        save_backup_interval = self.algo_args["train"].get("save_backup_interval", 100)
+        
+        # 1. 准备全局综合状态字典
+        checkpoint = {
+            "episode": episode,
+            "actors": {},
+            "critic_state_dict": self.critic.critic.state_dict(),
+            "critic_optimizer_state_dict": self.critic.critic_optimizer.state_dict()
+        }
+
+        # 2. 收集每个 Actor 的状态 (利用我们在 on_policy_base.py 中加的 get_checkpoint)
         for agent_id in range(self.num_agents):
-            policy_actor = self.actor[agent_id].actor
+            checkpoint["actors"][f"agent_{agent_id}"] = self.actor[agent_id].get_checkpoint()
+
+        # 3. 收集 value normalizer (如果用了的话)
+        if self.value_normalizer is not None:
+            checkpoint["value_normalizer_state_dict"] = self.value_normalizer.state_dict()
+
+        # 4. 始终保存一份 latest.pt
+        latest_path = os.path.join(self.save_dir, "latest.pt")
+        torch.save(checkpoint, latest_path)
+
+        # 5. 每隔 m 步保存一份 backup
+        if episode is not None and episode % save_backup_interval == 0:
+            backup_path = os.path.join(self.save_dir, f"backup_ep{episode}.pt")
+            torch.save(checkpoint, backup_path)
+            
+        # 为了向后兼容，也保留原来那种零散的 pt 文件 (给 render 使用)
+        for agent_id in range(self.num_agents):
             torch.save(
-                policy_actor.state_dict(),
+                self.actor[agent_id].actor.state_dict(),
                 str(self.save_dir) + "/actor_agent" + str(agent_id) + ".pt",
             )
-        policy_critic = self.critic.critic
         torch.save(
-            policy_critic.state_dict(), str(self.save_dir) + "/critic_agent" + ".pt"
+            self.critic.critic.state_dict(), str(self.save_dir) + "/critic_agent" + ".pt"
         )
         if self.value_normalizer is not None:
             torch.save(
@@ -739,28 +742,46 @@ class OnPolicyBaseRunner:
                 str(self.save_dir) + "/value_normalizer" + ".pt",
             )
 
+    # === 【新重构的加载方法：支持完美断点重续】 ===
     def restore(self):
-        """Restore model parameters."""
-        for agent_id in range(self.num_agents):
-            policy_actor_state_dict = torch.load(
-                str(self.algo_args["train"]["model_dir"])
-                + "/actor_agent"
-                + str(agent_id)
-                + ".pt"
-            )
-            self.actor[agent_id].actor.load_state_dict(policy_actor_state_dict)
-        if not self.algo_args["render"]["use_render"]:
-            policy_critic_state_dict = torch.load(
-                str(self.algo_args["train"]["model_dir"]) + "/critic_agent" + ".pt"
-            )
-            self.critic.critic.load_state_dict(policy_critic_state_dict)
-            if self.value_normalizer is not None:
-                value_normalizer_state_dict = torch.load(
-                    str(self.algo_args["train"]["model_dir"])
-                    + "/value_normalizer"
-                    + ".pt"
-                )
-                self.value_normalizer.load_state_dict(value_normalizer_state_dict)
+        """Restore model parameters for perfect resume or rendering."""
+        model_dir = str(self.algo_args["train"]["model_dir"])
+        
+        # 尝试寻找综合的 checkpoint 文件 (优先加载 latest.pt)
+        latest_path = os.path.join(model_dir, "latest.pt")
+        
+        if os.path.exists(latest_path) and not self.algo_args["render"]["use_render"]:
+            print(f"==> Resuming perfectly from {latest_path}")
+            checkpoint = torch.load(latest_path, map_location=self.device)
+            
+            # 恢复当前轮数
+            self.start_episode = checkpoint.get("episode", 0) + 1
+            
+            # 恢复 Actors 和 Actor Optimizers
+            for agent_id in range(self.num_agents):
+                self.actor[agent_id].load_checkpoint(checkpoint["actors"][f"agent_{agent_id}"])
+                
+            # 恢复 Critic 和 Critic Optimizer
+            self.critic.critic.load_state_dict(checkpoint["critic_state_dict"])
+            self.critic.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
+            
+            # 恢复 Value Normalizer
+            if self.value_normalizer is not None and "value_normalizer_state_dict" in checkpoint:
+                self.value_normalizer.load_state_dict(checkpoint["value_normalizer_state_dict"])
+                
+        else:
+            # 兼容老版本的纯推理模式加载
+            print("==> Resuming from separated .pt files (Legacy Mode / Render Mode)")
+            for agent_id in range(self.num_agents):
+                policy_actor_state_dict = torch.load(model_dir + "/actor_agent" + str(agent_id) + ".pt", map_location=self.device)
+                self.actor[agent_id].actor.load_state_dict(policy_actor_state_dict)
+                
+            if not self.algo_args["render"]["use_render"]:
+                policy_critic_state_dict = torch.load(model_dir + "/critic_agent" + ".pt", map_location=self.device)
+                self.critic.critic.load_state_dict(policy_critic_state_dict)
+                if self.value_normalizer is not None:
+                    value_normalizer_state_dict = torch.load(model_dir + "/value_normalizer" + ".pt", map_location=self.device)
+                    self.value_normalizer.load_state_dict(value_normalizer_state_dict)
 
     def close(self):
         """Close environment, writter, and logger."""

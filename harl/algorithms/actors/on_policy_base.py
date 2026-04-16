@@ -1,3 +1,5 @@
+# harl/algorithms/actors/on_policy_base.py
+
 """Base class for on-policy algorithms."""
 
 import torch
@@ -66,34 +68,30 @@ class OnPolicyBase:
         )
         return actions, action_log_probs, rnn_states_actor
 
-    def evaluate_actions(
-        self,
-        obs,
-        rnn_states_actor,
-        action,
-        masks,
-        available_actions=None,
-        active_masks=None,
-    ):
-        """Get action logprobs, entropy, and distributions for actor update.
-        Args:
-            obs: (np.ndarray / torch.Tensor) local agent inputs to the actor.
-            rnn_states_actor: (np.ndarray / torch.Tensor) if actor has RNN layer, RNN states for actor.
-            action: (np.ndarray / torch.Tensor) actions whose log probabilities and entropy to compute.
-            masks: (np.ndarray / torch.Tensor) denotes points at which RNN states should be reset.
-            available_actions: (np.ndarray / torch.Tensor) denotes which actions are available to agent
-                                    (if None, all actions available)
-            active_masks: (np.ndarray / torch.Tensor) denotes whether an agent is active or dead.
-        """
+    # 文件路径: harl/algorithms/actors/on_policy_base.py
 
+    def evaluate_actions(
+        self, obs, rnn_states, action, masks, available_actions=None, active_masks=None, return_aux=False, return_action_pred=False
+    ):
+        # === 【增量修改 4】：动态解包 5 个返回值 ===
         (
             action_log_probs,
             dist_entropy,
             action_distribution,
+            predicted_embedding,
+            predicted_joint_actions
         ) = self.actor.evaluate_actions(
-            obs, rnn_states_actor, action, masks, available_actions, active_masks
+            obs, rnn_states, action, masks, available_actions, active_masks, return_aux=return_aux, return_action_pred=return_action_pred
         )
-        return action_log_probs, dist_entropy, action_distribution
+        
+        if return_aux and return_action_pred:
+            return action_log_probs, dist_entropy, action_distribution, predicted_embedding, predicted_joint_actions
+        elif return_aux:
+            return action_log_probs, dist_entropy, action_distribution, predicted_embedding
+        elif return_action_pred:
+            return action_log_probs, dist_entropy, action_distribution, predicted_joint_actions
+        else:
+            return action_log_probs, dist_entropy, action_distribution
 
     def act(
         self, obs, rnn_states_actor, masks, available_actions=None, deterministic=False
@@ -135,3 +133,18 @@ class OnPolicyBase:
     def prep_rollout(self):
         """Prepare for rollout."""
         self.actor.eval()
+
+    # ====================================================================
+    # === 【新增】：为了支持完美断点重续，不仅要取 actor，还要取 optimizer
+    # ====================================================================
+    def get_checkpoint(self):
+        """Return the actor and optimizer state dicts for perfect resume."""
+        return {
+            "actor_state_dict": self.actor.state_dict(),
+            "optimizer_state_dict": self.actor_optimizer.state_dict()
+        }
+
+    def load_checkpoint(self, checkpoint):
+        """Load the actor and optimizer states from a checkpoint dict."""
+        self.actor.load_state_dict(checkpoint["actor_state_dict"])
+        self.actor_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

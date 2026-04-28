@@ -1,3 +1,11 @@
+# harl/examples/train.py
+
+import harl
+print("\n" + "="*50)
+print(f"【终极测谎仪】当前加载的 HARL 包路径是：\n {harl.__file__}")
+print("="*50 + "\n")
+
+
 """Train an algorithm."""
 import argparse
 import json
@@ -69,6 +77,8 @@ def main():
             all_config = json.load(file)
         args["algo"] = all_config["main_args"]["algo"]
         args["env"] = all_config["main_args"]["env"]
+        # 👇 === 新增这一行 === 👇
+        args["exp_name"] = all_config["main_args"]["exp_name"] 
         algo_args = all_config["algo_args"]
         env_args = all_config["env_args"]
     else:  # load config from corresponding yaml file

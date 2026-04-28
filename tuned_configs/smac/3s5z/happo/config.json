@@ -69,7 +69,7 @@
             "log_interval": 5,
             "model_dir": null,
             "n_rollout_threads": 20,
-            "num_env_steps": 20000000,
+            "num_env_steps": 5000000,
             "use_linear_lr_decay": false,
             "use_valuenorm": true,
             "use_proper_time_limits": true
@@ -82,7 +82,7 @@
     "main_args": {
         "algo": "happo",
         "env": "smac",
-        "exp_name": "report",
+        "exp_name": "HAPPO_baseline",
         "load_config": ""
     }
 }

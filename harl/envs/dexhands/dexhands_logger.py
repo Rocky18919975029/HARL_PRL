@@ -39,6 +39,7 @@ class DexHandsLogger(BaseLogger):
                 critic_train_info["average_step_rewards"]
             )
         )
+        
 
         if len(self.done_episodes_rewards) > 0:
             aver_episode_rewards = np.mean(self.done_episodes_rewards)

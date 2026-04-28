@@ -74,13 +74,7 @@ class OnPolicyBase:
         self, obs, rnn_states, action, masks, available_actions=None, active_masks=None, return_aux=False, return_action_pred=False
     ):
         # === 【增量修改 4】：动态解包 5 个返回值 ===
-        (
-            action_log_probs,
-            dist_entropy,
-            action_distribution,
-            predicted_embedding,
-            predicted_joint_actions
-        ) = self.actor.evaluate_actions(
+        action_log_probs, dist_entropy, action_distribution, *_ = self.actor.evaluate_actions(
             obs, rnn_states, action, masks, available_actions, active_masks, return_aux=return_aux, return_action_pred=return_action_pred
         )
         

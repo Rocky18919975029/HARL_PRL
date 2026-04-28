@@ -101,11 +101,15 @@ class OnPolicyBaseRunner:
         from harl.utils.envs_tools import get_shape_from_act_space
         total_action_dim = sum([get_shape_from_act_space(self.envs.action_space[i]) for i in range(self.num_agents)])
         algo_args["algo"]["total_action_dim"] = total_action_dim
+        
+        # === 【增量修改 2】：把 num_agents 塞进配置里，供 MAGPO 使用 ===
+        algo_args["algo"]["num_agents"] = self.num_agents
+
         # actor
         if self.share_param:
             self.actor = []
             agent = ALGO_REGISTRY[args["algo"]](
-                {**algo_args["model"], **algo_args["algo"]},
+                {**algo_args["model"], **algo_args["algo"]}, # <--- 这里会自动带着 num_agents 传给 magpo.py
                 self.envs.observation_space[0],
                 self.envs.action_space[0],
                 device=self.device,
@@ -161,6 +165,40 @@ class OnPolicyBaseRunner:
             else:
                 raise NotImplementedError
 
+            # =========================================================================
+            # === 【新增：MAGPO / CTDS 的集中式导师网络 (Guider)】 ===
+            # =========================================================================
+            self.use_guider = algo_args["algo"].get("use_guider", False)
+
+            if self.use_guider:
+                # 动态选择使用 MAT 还是 Sable 作为 Guider
+                guider_type = algo_args["algo"].get("guider_type", "sable").lower()
+                
+                if guider_type == "mat":
+                    from harl.models.policy_models.ar_guider_mat import ARGuiderPolicyMAT
+                    GuiderClass = ARGuiderPolicyMAT
+                else:
+                    from harl.models.policy_models.ar_guider_sable import ARGuiderPolicySable
+                    GuiderClass = ARGuiderPolicySable
+                
+                # 初始化单体全局自回归策略
+                self.guider = GuiderClass(
+                    {**algo_args["model"], **algo_args["algo"]},
+                    share_obs_space=self.envs.share_observation_space[0],
+                    action_space=self.envs.action_space[0], 
+                    num_agents=self.num_agents,
+                    device=self.device,
+                )
+                
+                # 为 Guider 配备一个独立的优化器
+                self.guider_optimizer = torch.optim.Adam(
+                    self.guider.parameters(),
+                    lr=algo_args["model"]["lr"],
+                    eps=algo_args["model"]["opti_eps"],
+                    weight_decay=algo_args["model"]["weight_decay"],
+                )
+
+
             if self.algo_args["train"]["use_valuenorm"] is True:
                 self.value_normalizer = ValueNorm(1, device=self.device)
             else:
@@ -177,11 +215,18 @@ class OnPolicyBaseRunner:
 
     def run(self):
         """Run the training (or rendering) pipeline."""
+  
         if self.algo_args["render"]["use_render"] is True:
             self.render()
             return
         print("start running")
         self.warmup()
+
+        # ==========================================
+        # === 【新增：记录训练开始时间】 ===
+        # ==========================================
+        import time # 确保顶部或者这里 import 了 time
+        train_start_time = time.time()
 
         episodes = (
             int(self.algo_args["train"]["num_env_steps"])
@@ -204,6 +249,10 @@ class OnPolicyBaseRunner:
                     for agent_id in range(self.num_agents):
                         self.actor[agent_id].lr_decay(episode, episodes)
                 self.critic.lr_decay(episode, episodes)
+                # ===【补充 Guider 的衰减】===
+                if getattr(self, "use_guider", False):
+                    from harl.utils.models_tools import update_linear_schedule
+                    update_linear_schedule(self.guider_optimizer, episode, episodes, self.algo_args["model"]["lr"])
 
             self.logger.episode_init(episode)  # logger callback at the beginning of each episode
 
@@ -312,11 +361,30 @@ class OnPolicyBaseRunner:
             
             # ===【新增】: 进度条步进 ===
             pbar.update(1)
-            
-            # ===【新增】: 进度条步进 ===
-            pbar.update(1)
 
         pbar.close()
+
+        # ==========================================
+        # === 【新增：计算并保存总训练时长】 ===
+        # ==========================================
+        train_end_time = time.time()
+        total_time_sec = train_end_time - train_start_time
+        
+        # 格式化为 小时:分钟:秒
+        hours, rem = divmod(total_time_sec, 3600)
+        minutes, seconds = divmod(rem, 60)
+        time_str = f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
+        
+        print(f"\n🎉 Training Pipeline Finished!")
+        print(f"⏱️  Total Training Time: {time_str}")
+        
+        # 将时间写入一个单独的 txt 文件，保存在 log_dir 下，防止清屏后找不到
+        time_log_path = os.path.join(self.run_dir, "training_time.txt")
+        with open(time_log_path, "w") as f:
+            f.write(f"Start Episode: {self.start_episode}\n")
+            f.write(f"End Episode: {episodes}\n")
+            f.write(f"Total Training Time (Seconds): {total_time_sec:.2f}\n")
+            f.write(f"Total Training Time (Formatted): {time_str}\n")
 
     def warmup(self):
         """Warm up the replay buffer."""
@@ -337,24 +405,53 @@ class OnPolicyBaseRunner:
     @torch.no_grad()
     def collect(self, step):
         """Collect actions and values from actors and critics."""
-        action_collector = []
-        action_log_prob_collector = []
-        rnn_state_collector = []
-        for agent_id in range(self.num_agents):
-            action, action_log_prob, rnn_state = self.actor[agent_id].get_actions(
-                self.actor_buffer[agent_id].obs[step],
-                self.actor_buffer[agent_id].rnn_states[step],
-                self.actor_buffer[agent_id].masks[step],
-                self.actor_buffer[agent_id].available_actions[step]
-                if self.actor_buffer[agent_id].available_actions is not None
-                else None,
+        if self.use_guider:
+            # 1. 拿到当前的全局状态 (share_obs)
+            current_share_obs = self.critic_buffer.share_obs[step]
+            if self.state_type == "FP":
+                current_share_obs = np.concatenate(current_share_obs)
+
+            # 2. 准备 available_actions
+            available_actions = None
+            if self.actor_buffer[0].available_actions is not None:
+                avail_acts = [self.actor_buffer[i].available_actions[step] for i in range(self.num_agents)]
+                available_actions = np.stack(avail_acts, axis=1) # [Batch, N, Dim]
+
+            # 3. 使用 Guider 一次性自回归生成所有 Agent 的动作
+            # 这里的 get_actions 就是我们在 ar_guider_sable 里写的 O(N) 循环
+            actions_pt, action_log_probs_pt = self.guider.get_actions(
+                current_share_obs, available_actions, deterministic=False
             )
-            action_collector.append(_t2n(action))
-            action_log_prob_collector.append(_t2n(action_log_prob))
-            rnn_state_collector.append(_t2n(rnn_state))
-        actions = np.array(action_collector).transpose(1, 0, 2)
-        action_log_probs = np.array(action_log_prob_collector).transpose(1, 0, 2)
-        rnn_states = np.array(rnn_state_collector).transpose(1, 0, 2, 3)
+            
+            # 4. Guider 返回的已经是完美的 [Batch, Num_Agents, Dim]，绝对不要转置！
+            actions = _t2n(actions_pt)
+            action_log_probs = _t2n(action_log_probs_pt)
+            
+            # Dummy RNN State 必须与上面保持一致，即 [Batch, Num_Agents, 1, Hidden_Dim]
+            rnn_states = np.zeros(
+                (self.algo_args["train"]["n_rollout_threads"], self.num_agents, self.recurrent_n, self.rnn_hidden_size),
+                dtype=np.float32
+            )
+            
+        else:
+            action_collector = []
+            action_log_prob_collector = []
+            rnn_state_collector = []
+            for agent_id in range(self.num_agents):
+                action, action_log_prob, rnn_state = self.actor[agent_id].get_actions(
+                    self.actor_buffer[agent_id].obs[step],
+                    self.actor_buffer[agent_id].rnn_states[step],
+                    self.actor_buffer[agent_id].masks[step],
+                    self.actor_buffer[agent_id].available_actions[step]
+                    if self.actor_buffer[agent_id].available_actions is not None
+                    else None,
+                )
+                action_collector.append(_t2n(action))
+                action_log_prob_collector.append(_t2n(action_log_prob))
+                rnn_state_collector.append(_t2n(rnn_state))
+            actions = np.array(action_collector).transpose(1, 0, 2)
+            action_log_probs = np.array(action_log_prob_collector).transpose(1, 0, 2)
+            rnn_states = np.array(rnn_state_collector).transpose(1, 0, 2, 3)
 
         if self.state_type == "EP":
             value, rnn_state_critic = self.critic.get_values(
@@ -490,21 +587,47 @@ class OnPolicyBaseRunner:
         )
 
         while True:
-            eval_actions_collector = []
-            for agent_id in range(self.num_agents):
-                eval_actions, temp_rnn_state = self.actor[agent_id].act(
-                    eval_obs[:, agent_id],
-                    eval_rnn_states[:, agent_id],
-                    eval_masks[:, agent_id],
-                    eval_available_actions[:, agent_id]
-                    if eval_available_actions[0] is not None
-                    else None,
-                    deterministic=True,
-                )
-                eval_rnn_states[:, agent_id] = _t2n(temp_rnn_state)
-                eval_actions_collector.append(_t2n(eval_actions))
+            # =================================================================
+            # === 【修复：MAT / Sable 必须使用中心化的 Guider 进行评估】 ===
+            # =================================================================
+            if self.args["algo"] in ["mat", "sable"]:
+                current_share_obs = eval_share_obs
+                if self.state_type == "FP":
+                    current_share_obs = np.concatenate(current_share_obs)
+                
+                # 准备 available_actions
+                available_actions = None
+                if eval_available_actions[0] is not None:
+                    avail_acts = [eval_available_actions[:, i] for i in range(self.num_agents)]
+                    available_actions = np.stack(avail_acts, axis=1) # [Batch, N, Dim]
 
-            eval_actions = np.array(eval_actions_collector).transpose(1, 0, 2)
+                # 调用 Guider 进行自回归解码
+                actions_pt, _ = self.guider.get_actions(
+                    current_share_obs, available_actions, deterministic=True
+                )
+                
+                # 转成 Numpy 并调整维度给环境 [N, Batch, Dim]
+                eval_actions = _t2n(actions_pt).transpose(1, 0, 2)
+                
+            # =================================================================
+            # === 【MAGPO, CTDS, HAPPO, MAPPO 依然使用去中心化的 Actor】 ===
+            # =================================================================
+            else:
+                eval_actions_collector = []
+                for agent_id in range(self.num_agents):
+                    eval_actions, temp_rnn_state = self.actor[agent_id].act(
+                        eval_obs[:, agent_id],
+                        eval_rnn_states[:, agent_id],
+                        eval_masks[:, agent_id],
+                        eval_available_actions[:, agent_id]
+                        if eval_available_actions[0] is not None
+                        else None,
+                        deterministic=True,
+                    )
+                    eval_rnn_states[:, agent_id] = _t2n(temp_rnn_state)
+                    eval_actions_collector.append(_t2n(eval_actions))
+
+                eval_actions = np.array(eval_actions_collector).transpose(1, 0, 2)
 
             (
                 eval_obs,
@@ -686,6 +809,9 @@ class OnPolicyBaseRunner:
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_rollout()
         self.critic.prep_rollout()
+        # ===【补充切换 Guider】===
+        if getattr(self, "use_guider", False):
+            self.guider.eval()
 
     # === 【找回的方法：准备训练】 ===
     def prep_training(self):
@@ -693,6 +819,9 @@ class OnPolicyBaseRunner:
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_training()
         self.critic.prep_training()
+        # ===【补充切换 Guider】===
+        if getattr(self, "use_guider", False):
+            self.guider.train()
 
     # === 【新重构的保存方法】 ===
     def save(self, episode=None):
@@ -709,6 +838,10 @@ class OnPolicyBaseRunner:
             "critic_state_dict": self.critic.critic.state_dict(),
             "critic_optimizer_state_dict": self.critic.critic_optimizer.state_dict()
         }
+        # ===【补充保存 Guider】===
+        if getattr(self, "use_guider", False):
+            checkpoint["guider_state_dict"] = self.guider.state_dict()
+            checkpoint["guider_optimizer_state_dict"] = self.guider_optimizer.state_dict()
 
         # 2. 收集每个 Actor 的状态 (利用我们在 on_policy_base.py 中加的 get_checkpoint)
         for agent_id in range(self.num_agents):
@@ -764,6 +897,11 @@ class OnPolicyBaseRunner:
             # 恢复 Critic 和 Critic Optimizer
             self.critic.critic.load_state_dict(checkpoint["critic_state_dict"])
             self.critic.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
+
+            # ===【补充加载 Guider】===
+            if getattr(self, "use_guider", False) and "guider_state_dict" in checkpoint:
+                self.guider.load_state_dict(checkpoint["guider_state_dict"])
+                self.guider_optimizer.load_state_dict(checkpoint["guider_optimizer_state_dict"])
             
             # 恢复 Value Normalizer
             if self.value_normalizer is not None and "value_normalizer_state_dict" in checkpoint:

@@ -415,4 +415,9 @@ tags
 # Persistent undo
 [._]*.un~
 
-results/
+
+--log_dir/
+
+--log_dir/
+plots/
+nohup.out

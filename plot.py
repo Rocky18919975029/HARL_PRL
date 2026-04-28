@@ -1,212 +1,230 @@
 import os
-import glob
 import re
+import argparse
+from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.interpolate import interp1d
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from scipy.interpolate import interp1d
 
-TAGS_OF_INTEREST = {
-    "Train Reward": ["average_episode_rewards", "train_episode_rewards"],
-    "Eval Reward": ["eval_average_episode_rewards", "eval_episode_rewards", "eval_reward"],
-    "Aux Loss": ["avg_aux_loss", "avg_action_pred_loss"]
-}
+# 设置更美观的绘图风格
+sns.set_theme(style="whitegrid")
+plt.rcParams.update({'font.size': 12, 'figure.figsize': (10, 6)})
 
-COLORS = ["#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B4", "#91D1C2", "#DC0000", "#7E6148", "#FFB90F", "#9467BD", "#2CA02C"]
-LINE_STYLES = ['-', '-', '-', '-', '-', '-', '--', '--', '--', '--', '--', '--']
-
-def set_academic_style():
-    sns.set_theme(style="ticks")
-    plt.rcParams.update({
-        "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"],
-        "axes.labelsize": 14, "font.size": 12, "legend.fontsize": 11,
-        "xtick.labelsize": 12, "ytick.labelsize": 12, "axes.linewidth": 1.2,
-        "grid.linewidth": 0.8, "grid.linestyle": "--", "grid.alpha": 0.6,
-        "figure.figsize": (8, 5.5), "figure.dpi": 300, "savefig.dpi": 300, "savefig.bbox": "tight"
-    })
-
-def smooth(scalars, weight=0.85):
-    if len(scalars) == 0: return scalars
+def smooth_curve(scalars, weight=0.8):
+    """
+    指数移动平均 (EMA) 平滑算法
+    """
+    if len(scalars) == 0:
+        return scalars
     last = scalars[0]
-    smoothed = []
+    smoothed =[]
     for point in scalars:
+        if np.isnan(point):
+            smoothed.append(point)
+            continue
         smoothed_val = last * weight + (1 - weight) * point
         smoothed.append(smoothed_val)
         last = smoothed_val
     return np.array(smoothed)
 
-def extract_data_from_tb(event_file, target_tags):
-    """从单个 event file 中提取指定 Tag 的数据"""
-    ea = EventAccumulator(event_file, size_guidance={'scalars': 0})
-    ea.Reload()
-    data = {}
+def get_experiment_groups(root_dirs, include_list=None):
+    """
+    遍历多目录，收集实验、seed和时间戳路径
+    """
+    exp_dict = defaultdict(lambda: defaultdict(list))
     
-    for tag in ea.Tags().get('scalars', []):
-        matched_category = None
-        tag_lower = tag.lower()
-        
-        # === 【核心修复：精准阻断子串冲突】 ===
-        if "eval" in tag_lower and "reward" in tag_lower:
-            matched_category = "Eval Reward"
-        elif "reward" in tag_lower and "eval" not in tag_lower:  # 明确排除 eval
-            matched_category = "Train Reward"
-        elif "aux_loss" in tag_lower or "action_pred_loss" in tag_lower:
-            matched_category = "Aux Loss"
+    # 匹配类似于 seed-00001-2026-04-20-21-56-45 的文件夹
+    pattern = re.compile(r'(seed-\d+)-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})')
+    
+    for root_idx, root_dir in enumerate(root_dirs):
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            dirname = os.path.basename(dirpath)
+            match = pattern.match(dirname)
             
-        if matched_category:
-            events = ea.Scalars(tag)
-            if matched_category not in data:
-                data[matched_category] = {}
-            for e in events:
-                data[matched_category][e.step] = e.value
+            if match:
+                seed_str = match.group(1)
+                timestamp_str = match.group(2)
+                # 自动提取所在文件夹的名字作为实验名 (如 HAPPO_baseline)
+                exp_name = os.path.basename(os.path.dirname(dirpath))
                 
+                # ==========================================
+                # === 【核心升级】：根据 include 列表进行过滤 ===
+                # ==========================================
+                if include_list is not None and exp_name not in include_list:
+                    continue
+                
+                tb_folder = os.path.join(dirpath, "logs")
+                if not os.path.exists(tb_folder):
+                    tb_folder = dirpath # fallback
+                    
+                # 生成全局唯一的 Seed ID，防止不同目录使用相同的 seed_str 导致冲突
+                unique_seed_id = f"{root_dir}_{seed_str}"
+                
+                exp_dict[exp_name][unique_seed_id].append((timestamp_str, tb_folder))
+            
+    # 排序并提纯路径（处理断点重续）
+    for exp_name in exp_dict:
+        for seed_id in exp_dict[exp_name]:
+            exp_dict[exp_name][seed_id].sort(key=lambda x: x[0])
+            exp_dict[exp_name][seed_id] = [x[1] for x in exp_dict[exp_name][seed_id]]
+            
+    return exp_dict
+
+def read_tb_logs(folder, tags):
+    """
+    读取单个 TensorBoard 日志文件夹及其所有子文件夹里的指定 tags
+    """
+    data = {tag: {} for tag in tags}
+    found_any_tags = set()
+    
+    for root_path, dirs, files in os.walk(folder):
+        if any(f.startswith('events.out.tfevents') for f in files):
+            try:
+                ea = EventAccumulator(root_path, size_guidance={'scalars': 0})
+                ea.Reload()
+                available_scalars = ea.Tags().get('scalars',[])
+                found_any_tags.update(available_scalars)
+                
+                for tag in tags:
+                    if tag in available_scalars:
+                        for event in ea.Scalars(tag):
+                            data[tag][event.step] = event.value
+            except Exception as e:
+                print(f"Error reading {root_path}: {e}")
+                
+    if not hasattr(read_tb_logs, "printed_tags") and found_any_tags:
+        print(f"\n  [Debug] Found the following scalars across all event files:\n  {list(found_any_tags)}\n")
+        read_tb_logs.printed_tags = True
+        
     return data
 
-def process_single_experiment(exp_dir):
-    print(f"Processing Experiment: {exp_dir}")
-    experiment_data = {} 
-    raw_seed_data = {} 
-
-    # 直接遍历该实验目录下的所有文件，挖地三尺找 event 文件
-    for root, _, files in os.walk(exp_dir):
-        for f in files:
-            if "events.out.tfevents" in f:
-                event_file = os.path.join(root, f)
-                match = re.search(r'(seed-\d+)', root)
-                if not match: continue
-                seed_name = match.group(1)
-                
-                try:
-                    run_data = extract_data_from_tb(event_file, TAGS_OF_INTEREST)
-                    if any(len(v) > 0 for v in run_data.values()):
-                        if seed_name not in raw_seed_data:
-                            raw_seed_data[seed_name] = []
-                        raw_seed_data[seed_name].append((event_file, run_data))
-                except Exception as e:
-                    print(f"Warning: Failed to read {event_file}. Error: {e}")
-
-    for seed_name, files_and_data in raw_seed_data.items():
-        files_and_data.sort(key=lambda x: x[0])
-        merged_seed_data = {} 
-        for _, run_data in files_and_data:
-            for tag, step_val_dict in run_data.items():
-                if tag not in merged_seed_data:
-                    merged_seed_data[tag] = {}
-                merged_seed_data[tag].update(step_val_dict)
-        
-        for tag, step_val_dict in merged_seed_data.items():
-            if not step_val_dict: continue
-            steps = np.array(sorted(step_val_dict.keys()))
-            values = np.array([step_val_dict[s] for s in steps])
-            if tag not in experiment_data:
-                experiment_data[tag] = []
-            experiment_data[tag].append((steps, values))
-            
-    return experiment_data
-
-def plot_experiments(exp_dirs, exp_labels=None, smooth_weight=0.85):
-    set_academic_style()
-    if exp_labels is None:
-        exp_labels = [os.path.basename(os.path.normpath(d)) for d in exp_dirs]
-        
-    all_data = {tag: {} for tag in TAGS_OF_INTEREST.keys()}
+def plot_experiments(exp_dict, target_tags, save_dir, smooth_weight):
+    """
+    处理数据并画出带有多 Seed 阴影的图表
+    """
+    os.makedirs(save_dir, exist_ok=True)
     
-    for idx, exp_dir in enumerate(exp_dirs):
-        exp_data = process_single_experiment(exp_dir)
-        print(f"  [{exp_labels[idx]}] Valid data tags collected: {list(exp_data.keys())}")
-        for tag, seed_list in exp_data.items():
-            all_data[tag][exp_labels[idx]] = seed_list
-
-    for tag in TAGS_OF_INTEREST.keys():
-        tag_data = all_data[tag]
-        if not tag_data:
-            print(f"--- Skipping '{tag}': No data points found in any experiment (Maybe training stopped before first eval?). ---")
-            continue
-            
-        is_all_zero = True
-        for exp_name, seed_list in tag_data.items():
-            for steps, values in seed_list:
-                if np.any(np.abs(values) > 1e-6):
-                    is_all_zero = False; break
-        if tag == "Aux Loss" and is_all_zero:
-            continue
-            
-        fig, ax = plt.subplots()
-        plot_count = 0
+    for tag in target_tags:
+        plt.figure()
+        has_data_for_tag = False
         
-        for idx, (exp_name, seed_list) in enumerate(tag_data.items()):
-            if not seed_list: continue
-            color = COLORS[idx % len(COLORS)]
-            linestyle = LINE_STYLES[idx % len(LINE_STYLES)]
+        for exp_name, seeds_dict in exp_dict.items():
+            all_seed_steps =[]
+            all_seed_values =[]
             
-            min_step = max([s[0] for s, v in seed_list])
-            max_step = min([s[-1] for s, v in seed_list])
+            for seed_id, folders in seeds_dict.items():
+                merged_data = {}
+                for folder in folders:
+                    data = read_tb_logs(folder, [tag])
+                    merged_data.update(data[tag])
+                
+                if not merged_data:
+                    continue
+                    
+                steps, values = zip(*sorted(merged_data.items()))
+                all_seed_steps.append(steps)
+                all_seed_values.append(values)
             
-            if min_step > max_step: continue
-            if min_step == max_step:
-                print(f"  Warning: {exp_name} '{tag}' only has 1 valid data point! Cannot draw a line.")
+            if not all_seed_steps:
                 continue
+            
+            has_data_for_tag = True
+            
+            min_step = max([s[0] for s in all_seed_steps])
+            max_step = min([s[-1] for s in all_seed_steps])
+            
+            if min_step >= max_step:
+                min_step = min([s[0] for s in all_seed_steps])
+                max_step = max([s[-1] for s in all_seed_steps])
                 
             common_steps = np.linspace(min_step, max_step, 500)
-            interpolated_values = []
-            for steps, values in seed_list:
-                if len(steps) < 2: continue
-                smoothed_values = smooth(values, weight=smooth_weight)
-                f = interp1d(steps, smoothed_values, kind='linear', bounds_error=False, fill_value="extrapolate")
-                interpolated_values.append(f(common_steps))
             
-            if not interpolated_values: continue
+            interpolated_values =[]
+            for steps, values in zip(all_seed_steps, all_seed_values):
+                steps, idx = np.unique(steps, return_index=True)
+                values = np.array(values)[idx]
+                
+                if len(steps) > 1:
+                    f = interp1d(steps, values, bounds_error=False, fill_value=np.nan)
+                    interpolated_values.append(f(common_steps))
+                    
+            if not interpolated_values:
+                continue
+                
             interpolated_values = np.array(interpolated_values)
-            mean_vals = np.mean(interpolated_values, axis=0)
-            std_vals = np.std(interpolated_values, axis=0)
             
-            ax.plot(common_steps, mean_vals, label=exp_name, color=color, linestyle=linestyle, linewidth=2.0)
-            ax.fill_between(common_steps, mean_vals - std_vals, mean_vals + std_vals, color=color, alpha=0.15, edgecolor='none')
-            plot_count += 1
+            # 计算跨多 Seed 的 Mean 和 Std
+            mean_vals = np.nanmean(interpolated_values, axis=0)
+            std_vals = np.nanstd(interpolated_values, axis=0)
             
-        if plot_count == 0:
-            plt.close(fig)
-            continue
+            mean_vals_smooth = smooth_curve(mean_vals, weight=smooth_weight)
             
-        ax.set_title(tag, fontsize=16, fontweight='bold', pad=15)
-        ax.set_xlabel("Environment Steps", fontsize=14)
-        ax.set_ylabel("Value", fontsize=14)
-        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: f"{x*1e-6:g}M"))
-        ax.grid(True)
-        sns.despine(ax=ax)
-        
-        num_items = plot_count
-        ncols = 2 if num_items <= 6 else (3 if num_items <= 9 else 4)
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=ncols, frameon=False, prop={'size': 11})
-        
-        save_dir = "humanoid_visualization"
-        os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, tag.replace(" ", "_").lower() + ".pdf")
-        plt.savefig(filename)
-        plt.savefig(filename.replace(".pdf", ".png"))
-        print(f"Saved plot -> {filename}")
-        plt.close(fig)
+            # 画主曲线
+            p = sns.lineplot(x=common_steps, y=mean_vals_smooth, label=exp_name, linewidth=2)
+            
+            # 画阴影
+            if len(all_seed_steps) > 1:
+                plt.fill_between(common_steps, 
+                                 mean_vals_smooth - std_vals, 
+                                 mean_vals_smooth + std_vals, 
+                                 alpha=0.15, color=p.lines[-1].get_color())
+            
+        if has_data_for_tag:
+            plt.title(tag.replace("_", " ").title(), fontsize=16, fontweight='bold')
+            plt.xlabel("Environment Steps", fontsize=14)
+            plt.ylabel(tag, fontsize=14)
+            plt.legend(loc='best', frameon=True, fontsize=12)
+            plt.tight_layout()
+            
+            safe_tag_name = tag.replace("/", "_")
+            save_path = os.path.join(save_dir, f"{safe_tag_name}.png")
+            plt.savefig(save_path, dpi=300)
+            print(f"✅ Successfully plotted and saved: {save_path}")
+        else:
+            print(f"⚠️ Tag '{tag}' not found in any of the experiments. Skipped.")
+            
+        plt.close()
 
 if __name__ == "__main__":
-    experiments = [
-        "/home/zeshenghong/HARL/results/mamujoco/Humanoid-v2-17x1/mappo/harl_mappo",
-        "/home/zeshenghong/HARL/results/mamujoco/Humanoid-v2-17x1/happo/harl_happo",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/self_supervised_conditional_policy",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/self_supervised_conditional_policy_rnn",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/happo_deepNet",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/happo_deepNet_rnn",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/self_supervised",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/self_supervised_rnn",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/HAPPO_teammate_modeling_MLP",
-        "results/ablation_study/mamujoco/Humanoid-v2-17x1/happo/HAPPO_teammate_modeling_RNN",
+    parser = argparse.ArgumentParser(description="Plot HARL results from TensorBoard logs with Multi-Seed shading.")
+    
+    parser.add_argument("--dirs", type=str, nargs='+', required=True, 
+                        help="List of root directories OR specific experiment directories (e.g., results/seed_1/happo/HAPPO_baseline)")
+    # 【新增功能】：指定白名单
+    parser.add_argument("--include", type=str, nargs='+', default=None,
+                        help="Optional: Only plot these specific experiment names (e.g., HAPPO_baseline PRL_ours)")
+    
+    parser.add_argument("--save_dir", type=str, default="./plots",
+                        help="Directory to save the plots. Defaults to './plots' in current directory.")
+    parser.add_argument("--smooth", type=float, default=0,
+                        help="EMA smoothing factor (0.0 to 1.0). Default is 0.")
+    args = parser.parse_args()
+
+    target_tags =[
+        "eval_average_episode_rewards",
+        "train_episode_rewards",
+        "eval_win_rate",
+        "eval_score_rate"
     ]
     
-    labels = [
-        "MAPPO (Baseline)", "HAPPO (Baseline)", "HAPPO + cond Actor (MLP)",
-        "HAPPO + cond Actor (RNN)", "HAPPO + Deep Model (MLP)", "HAPPO + Deep Model (RNN)",
-        "HAPPO + Rep Learning (MLP)", "HAPPO + Rep Learning (RNN)",
-        "HAPPO + Teammate Modeling (MLP)", "HAPPO + Teammate Modeling (RNN)"
-    ]
+    save_dir = args.save_dir
     
-    plot_experiments(experiments, exp_labels=labels, smooth_weight=0.85)
+    print(f"🔍 Scanning {len(args.dirs)} directory paths...")
+    if args.include:
+        print(f"🎯 Filtering active! Only keeping experiments named: {args.include}")
+        
+    exp_dict = get_experiment_groups(args.dirs, include_list=args.include)
+    
+    if not exp_dict:
+        print("❌ No valid experiment logs found matching your criteria. Please check your paths or --include names.")
+        exit(1)
+        
+    print(f"\n📊 Found {len(exp_dict)} experiments ready to plot:")
+    for exp_name, seeds in exp_dict.items():
+        print(f"  - {exp_name}: {len(seeds)} total runs/seeds")
+        
+    print("\n🚀 Starting data extraction and plotting...")
+    plot_experiments(exp_dict, target_tags, save_dir, args.smooth)
+    print("🎉 All done!")

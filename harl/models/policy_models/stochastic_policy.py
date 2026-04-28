@@ -33,6 +33,8 @@ class StochasticPolicy(nn.Module):
         
         # === 【细化开关】：拆分为两个独立的控制变量 ===
         self.use_aux_loss = args.get("use_aux_loss", False)
+        # === 【新增：概率变分预测开关】 ===
+        self.use_prob_aux_loss = args.get("use_prob_aux_loss", False)
         self.condition_on_pred = args.get("condition_on_pred", False)
         
         if len(obs_shape) == 3:
@@ -64,6 +66,39 @@ class StochasticPolicy(nn.Module):
                 combined_dim = self.hidden_sizes[-1] + self.target_embed_dim
             else:
                 combined_dim = self.hidden_sizes[-1]
+                
+        # === 【新增：初始化概率变分预测头】 ===
+        elif self.use_prob_aux_loss:
+            self.target_embed_dim = self.hidden_sizes[-1]
+            # 预测均值 mu
+            self.prob_aux_head_mu = nn.Sequential(
+                nn.Linear(self.hidden_sizes[-1], self.hidden_sizes[-1]),
+                nn.ReLU(),
+                nn.Linear(self.hidden_sizes[-1], self.target_embed_dim)
+            )
+            # 预测对数方差 log_var (使用 log 方差防止出现负数方差，保证数值稳定性)
+            self.prob_aux_head_logvar = nn.Sequential(
+                nn.Linear(self.hidden_sizes[-1], self.hidden_sizes[-1]),
+                nn.ReLU(),
+                nn.Linear(self.hidden_sizes[-1], self.target_embed_dim)
+            )
+            
+            # 如果条件化，我们拼接预测的期望均值 mu 作为策略输入条件
+            if self.condition_on_pred:
+                combined_dim = self.hidden_sizes[-1] + self.target_embed_dim
+            else:
+                combined_dim = self.hidden_sizes[-1]
+        # 👇【新增这段 TAPPO 专属逻辑】👇
+        elif getattr(self, "use_action_pred", False):
+            predicted_joint_actions = self.action_pred_head(actor_features)
+            if getattr(self, "condition_on_pred", False):
+                # 将队友动作的预测结果（Detach防爆）作为额外条件拼接给策略
+                detached_pred = predicted_joint_actions.detach()
+                normalized_pred = F.layer_norm(detached_pred,[detached_pred.shape[-1]])
+                combined_features = torch.cat([actor_features, normalized_pred], dim=-1)
+            else:
+                combined_features = actor_features
+        # 👆【新增结束】👆        
         else:
             combined_dim = self.hidden_sizes[-1]
         
@@ -112,6 +147,18 @@ class StochasticPolicy(nn.Module):
                 combined_features = torch.cat([actor_features, normalized_pred], dim=-1)
             else:
                 combined_features = actor_features
+                
+        # === 【新增：前向传播中的概率变分特征拼接】 ===
+        elif self.use_prob_aux_loss:
+            mu = self.prob_aux_head_mu(actor_features)
+            # 前向采样阶段仅需拼接预期均值(mu)
+            if self.condition_on_pred:
+                detached_mu = mu.detach()
+                normalized_mu = F.layer_norm(detached_mu, [detached_mu.shape[-1]])
+                combined_features = torch.cat([actor_features, normalized_mu], dim=-1)
+            else:
+                combined_features = actor_features
+                
         else:
             combined_features = actor_features
 
@@ -151,6 +198,25 @@ class StochasticPolicy(nn.Module):
                 combined_features = torch.cat([actor_features, normalized_pred], dim=-1)
             else:
                 combined_features = actor_features
+                
+        # === 【新增：评估动作时的概率变分预测与特征拼接】 ===
+        elif self.use_prob_aux_loss:
+            mu = self.prob_aux_head_mu(actor_features)
+            logvar = self.prob_aux_head_logvar(actor_features)
+            
+            # 截断 logvar 防止方差过小或过大导致数值溢出（极度重要）
+            logvar = torch.clamp(logvar, min=-10.0, max=2.0)
+            
+            # 将 mu 和 logvar 打包为元组返回，后续在 happo.py 拆包计算 NLL
+            predicted_embedding = (mu, logvar)
+            
+            if self.condition_on_pred:
+                detached_mu = mu.detach()
+                normalized_mu = F.layer_norm(detached_mu, [detached_mu.shape[-1]])
+                combined_features = torch.cat([actor_features, normalized_mu], dim=-1)
+            else:
+                combined_features = actor_features
+                
         else:
             combined_features = actor_features
 
@@ -174,4 +240,4 @@ class StochasticPolicy(nn.Module):
         elif return_action_pred:
             return action_log_probs, dist_entropy, action_distribution, None, predicted_joint_actions
         else:
-            return action_log_probs, dist_entropy, action_distribution, None, None
+            return action_log_probs, dist_entropy, action_distribution

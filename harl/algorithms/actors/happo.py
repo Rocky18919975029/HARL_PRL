@@ -65,6 +65,9 @@ class HAPPO(OnPolicyBase):
         # 如果传入了 target_embedding，将它移到指定设备并 detach，防止影响 critic
         if target_embedding is not None:
             target_embedding = check(target_embedding).to(**self.tpdv).detach()
+            if self.args.get("use_target_norm", True):
+                target_embedding = F.layer_norm(target_embedding,[target_embedding.shape[-1]])
+
 
         # Reshape to do evaluations for all steps in a single forward pass
         # === 【修改代码：直接调用 actor 以获取 predicted_embedding】 ===
@@ -101,12 +104,37 @@ class HAPPO(OnPolicyBase):
                 factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True
             ).mean()
 
-        # === 【新增代码：计算辅助的 MSE 损失】 ===
+        # === 【修改代码：计算辅助的确定性MSE 或 概率性NLL损失】 ===
         aux_loss = torch.tensor(0.0).to(**self.tpdv)
         if target_embedding is not None:
-            # 也可以在这里对 active_masks_batch 掩码过滤，防止 padding 数据产生干扰
-            # 简单起见，这里直接算 MSE
-            aux_loss = F.mse_loss(predicted_embedding, target_embedding)
+            # --- 1. 概率性变分预测损失 (NLL) ---
+            if self.args.get("use_prob_aux_loss", False):
+                # predicted_embedding 是我们在 stochastic_policy 中打包的元组 (mu, logvar)
+                mu, logvar = predicted_embedding
+                var = torch.exp(logvar)
+                # 计算高斯负对数似然 (NLL): 0.5 * ((target - mu)^2 / var) + 0.5 * logvar
+                nll_loss = 0.5 * ((target_embedding - mu) ** 2) / var + 0.5 * logvar
+                
+                if self.use_policy_active_masks:
+                    nll_loss = nll_loss.mean(dim=-1, keepdim=True)
+                    aux_loss = (nll_loss * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    aux_loss = nll_loss.mean()
+                    
+            # --- 2. 确定性 MSE 预测损失 (原版逻辑) ---
+            else:
+                # 2. 确定性预测 (MSE or Huber)
+                use_huber = self.args.get("use_huber_aux_loss", False)
+                # 确定性预测：增加开关，恢复旧版“无脑 MSE”逻辑
+                if self.args.get("strict_mask_aux_loss", True) and self.use_policy_active_masks:
+                    unreduced_aux_mse = F.mse_loss(predicted_embedding, target_embedding, reduction='none')
+                    unreduced_aux_mse = unreduced_aux_mse.mean(dim=-1, keepdim=True)
+                    aux_loss = (unreduced_aux_mse * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    if use_huber:
+                        aux_loss = F.smooth_l1_loss(predicted_embedding, target_embedding)
+                    else:
+                        aux_loss = F.mse_loss(predicted_embedding, target_embedding)
 
         # === 【增量修改 9】：计算动作预测 MSE 损失 ===
         action_pred_loss = torch.tensor(0.0).to(**self.tpdv)

@@ -1,3 +1,5 @@
+# harl/runners/__init__.py
+
 """Runner registry."""
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.runners.on_policy_ma_runner import OnPolicyMARunner
@@ -15,4 +17,7 @@ RUNNER_REGISTRY = {
     "maddpg": OffPolicyMARunner,
     "matd3": OffPolicyMARunner,
     "mappo": OnPolicyMARunner,
+    "magpo": OnPolicyHARunner,
+    "sable": OnPolicyHARunner,
+    "mat": OnPolicyHARunner,
 }

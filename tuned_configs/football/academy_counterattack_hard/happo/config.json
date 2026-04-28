@@ -97,7 +97,7 @@
     "main_args": {
         "algo": "happo",
         "env": "football",
-        "exp_name": "report",
+        "exp_name": "HAPPO_baseline",
         "load_config": ""
     }
 }

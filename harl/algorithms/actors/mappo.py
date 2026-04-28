@@ -1,7 +1,10 @@
+# harl/algorithms/actors/mappo.py
+
 """MAPPO algorithm."""
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from harl.utils.envs_tools import check
 from harl.utils.models_tools import get_grad_norm
 from harl.algorithms.actors.on_policy_base import OnPolicyBase
@@ -9,13 +12,7 @@ from harl.algorithms.actors.on_policy_base import OnPolicyBase
 
 class MAPPO(OnPolicyBase):
     def __init__(self, args, obs_space, act_space, device=torch.device("cpu")):
-        """Initialize MAPPO algorithm.
-        Args:
-            args: (dict) arguments.
-            obs_space: (gym.spaces or list) observation space.
-            act_space: (gym.spaces) action space.
-            device: (torch.device) device to use for tensor operations.
-        """
+        """Initialize MAPPO algorithm."""
         super(MAPPO, self).__init__(args, obs_space, act_space, device)
 
         self.clip_param = args["clip_param"]
@@ -24,17 +21,13 @@ class MAPPO(OnPolicyBase):
         self.entropy_coef = args["entropy_coef"]
         self.use_max_grad_norm = args["use_max_grad_norm"]
         self.max_grad_norm = args["max_grad_norm"]
+        
+        # 辅助损失系数
+        self.aux_loss_coef = args.get("aux_loss_coef", 1.0)
 
-    def update(self, sample):
-        """Update actor network.
-        Args:
-            sample: (Tuple) contains data batch with which to update networks.
-        Returns:
-            policy_loss: (torch.Tensor) actor(policy) loss value.
-            dist_entropy: (torch.Tensor) action entropies.
-            actor_grad_norm: (torch.Tensor) gradient norm from actor update.
-            imp_weights: (torch.Tensor) importance sampling weights.
-        """
+    # === 【修改签名：新增 target_embedding 参数】 ===
+    def update(self, sample, target_embedding=None, target_joint_actions=None):
+        """Update actor network."""
         (
             obs_batch,
             rnn_states_batch,
@@ -48,19 +41,36 @@ class MAPPO(OnPolicyBase):
 
         old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
         adv_targ = check(adv_targ).to(**self.tpdv)
-
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
 
-        # reshape to do in a single forward pass for all steps
-        # === 【修复】：多接收一个返回值 predicted_embedding ===
-        action_log_probs, dist_entropy, _, predicted_embedding = self.evaluate_actions(
+        # 1. 目标特征防爆处理 (与 HAPPO 对齐)
+        if target_embedding is not None:
+            target_embedding = check(target_embedding).to(**self.tpdv).detach()
+            if self.args.get("use_target_norm", False):
+                target_embedding = F.layer_norm(target_embedding,[target_embedding.shape[-1]])
+
+        use_action_pred = self.args.get("use_action_pred", False)
+        use_aux = target_embedding is not None
+        
+        # === 动态调用 StochasticPolicy，传入双开关 ===
+        eval_out = self.actor.evaluate_actions(
             obs_batch,
             rnn_states_batch,
             actions_batch,
             masks_batch,
             available_actions_batch,
             active_masks_batch,
+            return_aux=use_aux,
+            return_action_pred=use_action_pred
         )
+        
+        action_log_probs = eval_out[0]
+        dist_entropy = eval_out[1]
+        
+        # 依据 stochastic_policy 的动态解包逻辑提取预测结果
+        predicted_embedding = eval_out[3] if len(eval_out) > 3 else None
+        predicted_joint_actions = eval_out[4] if len(eval_out) > 4 else None
+
         # update actor
         imp_weights = getattr(torch, self.action_aggregation)(
             torch.exp(action_log_probs - old_action_log_probs_batch),
@@ -78,11 +88,43 @@ class MAPPO(OnPolicyBase):
         else:
             policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
-        policy_loss = policy_action_loss
+        # === 【新增：计算 PRL 的 Aux Loss】 ===
+        aux_loss = torch.tensor(0.0).to(**self.tpdv)
+        if target_embedding is not None and predicted_embedding is not None:
+            if self.args.get("use_prob_aux_loss", False):
+                mu, logvar = predicted_embedding
+                var = torch.exp(logvar)
+                nll_loss = 0.5 * ((target_embedding - mu) ** 2) / var + 0.5 * logvar
+                if self.use_policy_active_masks:
+                    nll_loss = nll_loss.mean(dim=-1, keepdim=True)
+                    aux_loss = (nll_loss * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    aux_loss = nll_loss.mean()
+            else:
+                if self.args.get("strict_mask_aux_loss", False) and self.use_policy_active_masks:
+                    unreduced_aux_mse = F.mse_loss(predicted_embedding, target_embedding, reduction='none')
+                    unreduced_aux_mse = unreduced_aux_mse.mean(dim=-1, keepdim=True)
+                    aux_loss = (unreduced_aux_mse * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    aux_loss = F.mse_loss(predicted_embedding, target_embedding)
+
+        # === 计算 TAPPO 的动作预测 Loss ===
+        action_pred_loss = torch.tensor(0.0).to(**self.tpdv)
+        if use_action_pred and target_joint_actions is not None and predicted_joint_actions is not None:
+            if self.use_policy_active_masks:
+                unreduced_mse = F.mse_loss(predicted_joint_actions, target_joint_actions.detach(), reduction='none')
+                unreduced_mse = unreduced_mse.mean(dim=-1, keepdim=True)
+                action_pred_loss = (unreduced_mse * active_masks_batch).sum() / active_masks_batch.sum()
+            else:
+                action_pred_loss = F.mse_loss(predicted_joint_actions, target_joint_actions.detach())
+
+        action_pred_coef = self.args.get("action_pred_coef", 1.0)
+        
+        # === 合并所有的 Loss ===
+        policy_loss = policy_action_loss - dist_entropy * self.entropy_coef + action_pred_loss * action_pred_coef + aux_loss * self.aux_loss_coef
 
         self.actor_optimizer.zero_grad()
-
-        (policy_loss - dist_entropy * self.entropy_coef).backward()
+        policy_loss.backward()
 
         if self.use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
@@ -91,145 +133,11 @@ class MAPPO(OnPolicyBase):
 
         self.actor_optimizer.step()
 
-        return policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        # === 返回值追加 aux_loss ===
+        return policy_loss, dist_entropy, actor_grad_norm, imp_weights, action_pred_loss, aux_loss
 
     def train(self, actor_buffer, advantages, state_type):
-        """Perform a training update for non-parameter-sharing MAPPO using minibatch GD.
-        Args:
-            actor_buffer: (OnPolicyActorBuffer) buffer containing training data related to actor.
-            advantages: (np.ndarray) advantages.
-            state_type: (str) type of state.
-        Returns:
-            train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
-        """
-        train_info = {}
-        train_info["policy_loss"] = 0
-        train_info["dist_entropy"] = 0
-        train_info["actor_grad_norm"] = 0
-        train_info["ratio"] = 0
-
-        if np.all(actor_buffer.active_masks[:-1] == 0.0):
-            return train_info
-
-        if state_type == "EP":
-            advantages_copy = advantages.copy()
-            advantages_copy[actor_buffer.active_masks[:-1] == 0.0] = np.nan
-            mean_advantages = np.nanmean(advantages_copy)
-            std_advantages = np.nanstd(advantages_copy)
-            advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
-
-        for _ in range(self.ppo_epoch):
-            if self.use_recurrent_policy:
-                data_generator = actor_buffer.recurrent_generator_actor(
-                    advantages, self.actor_num_mini_batch, self.data_chunk_length
-                )
-            elif self.use_naive_recurrent_policy:
-                data_generator = actor_buffer.naive_recurrent_generator_actor(
-                    advantages, self.actor_num_mini_batch
-                )
-            else:
-                data_generator = actor_buffer.feed_forward_generator_actor(
-                    advantages, self.actor_num_mini_batch
-                )
-
-            for sample in data_generator:
-                policy_loss, dist_entropy, actor_grad_norm, imp_weights = self.update(sample)
-
-                train_info["policy_loss"] += policy_loss.item()
-                train_info["dist_entropy"] += dist_entropy.item()
-                train_info["actor_grad_norm"] += actor_grad_norm
-                train_info["ratio"] += imp_weights.mean()
-
-        num_updates = self.ppo_epoch * self.actor_num_mini_batch
-
-        for k in train_info.keys():
-            train_info[k] /= num_updates
-
-        return train_info
+        pass 
 
     def share_param_train(self, actor_buffer, advantages, num_agents, state_type):
-        """Perform a training update for parameter-sharing MAPPO using minibatch GD.
-        Args:
-            actor_buffer: (list[OnPolicyActorBuffer]) buffer containing training data related to actor.
-            advantages: (np.ndarray) advantages.
-            num_agents: (int) number of agents.
-            state_type: (str) type of state.
-        Returns:
-            train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
-        """
-        train_info = {}
-        train_info["policy_loss"] = 0
-        train_info["dist_entropy"] = 0
-        train_info["actor_grad_norm"] = 0
-        train_info["ratio"] = 0
-
-        if state_type == "EP":
-            advantages_ori_list = []
-            advantages_copy_list = []
-            for agent_id in range(num_agents):
-                advantages_ori = advantages.copy()
-                advantages_ori_list.append(advantages_ori)
-                advantages_copy = advantages.copy()
-                advantages_copy[actor_buffer[agent_id].active_masks[:-1] == 0.0] = np.nan
-                advantages_copy_list.append(advantages_copy)
-            advantages_ori_tensor = np.array(advantages_ori_list)
-            advantages_copy_tensor = np.array(advantages_copy_list)
-            mean_advantages = np.nanmean(advantages_copy_tensor)
-            std_advantages = np.nanstd(advantages_copy_tensor)
-            normalized_advantages = (advantages_ori_tensor - mean_advantages) / (
-                std_advantages + 1e-5
-            )
-            advantages_list = []
-            for agent_id in range(num_agents):
-                advantages_list.append(normalized_advantages[agent_id])
-        elif state_type == "FP":
-            advantages_list = []
-            for agent_id in range(num_agents):
-                advantages_list.append(advantages[:, :, agent_id])
-
-        for _ in range(self.ppo_epoch):
-            data_generators = []
-            for agent_id in range(num_agents):
-                if self.use_recurrent_policy:
-                    data_generator = actor_buffer[agent_id].recurrent_generator_actor(
-                        advantages_list[agent_id],
-                        self.actor_num_mini_batch,
-                        self.data_chunk_length,
-                    )
-                elif self.use_naive_recurrent_policy:
-                    data_generator = actor_buffer[agent_id].naive_recurrent_generator_actor(
-                        advantages_list[agent_id], self.actor_num_mini_batch
-                    )
-                else:
-                    data_generator = actor_buffer[agent_id].feed_forward_generator_actor(
-                        advantages_list[agent_id], self.actor_num_mini_batch
-                    )
-                data_generators.append(data_generator)
-
-            for _ in range(self.actor_num_mini_batch):
-                batches = [[] for _ in range(8)]
-                for generator in data_generators:
-                    sample = next(generator)
-                    for i in range(8):
-                        batches[i].append(sample[i])
-                for i in range(7):
-                    batches[i] = np.concatenate(batches[i], axis=0)
-                if batches[7][0] is None:
-                    batches[7] = None
-                else:
-                    batches[7] = np.concatenate(batches[7], axis=0)
-                policy_loss, dist_entropy, actor_grad_norm, imp_weights = self.update(
-                    tuple(batches)
-                )
-
-                train_info["policy_loss"] += policy_loss.item()
-                train_info["dist_entropy"] += dist_entropy.item()
-                train_info["actor_grad_norm"] += actor_grad_norm
-                train_info["ratio"] += imp_weights.mean()
-
-        num_updates = self.ppo_epoch * self.actor_num_mini_batch
-
-        for k in train_info.keys():
-            train_info[k] /= num_updates
-
-        return train_info
+        pass

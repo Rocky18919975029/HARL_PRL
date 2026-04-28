@@ -32,7 +32,7 @@
             "use_eval": false
         },
         "logger": {
-            "log_dir": "./results/ablation_study"
+            "log_dir": "./results"
         },
         "model": {
             "activation_func": "relu",
@@ -82,7 +82,7 @@
     "main_args": {
         "algo": "happo",
         "env": "dexhands",
-        "exp_name": "report",
+        "exp_name": "HAPPO_baseline",
         "load_config": ""
     }
 }

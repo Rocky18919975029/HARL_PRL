@@ -82,7 +82,7 @@
     "main_args": {
         "algo": "mappo",
         "env": "dexhands",
-        "exp_name": "report",
+        "exp_name": "MAPPO_baseline",
         "load_config": ""
     }
 }

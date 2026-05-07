@@ -1,4 +1,4 @@
-# harl/runners/on_policy_ma_runner.py
+
 
 """Runner for on-policy MA algorithms."""
 import numpy as np
@@ -13,7 +13,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
         """Training procedure for MAPPO, TAPPO, and MAPPO-PRL."""
         actor_train_infos =[]
 
-        # compute advantages
+       
         if self.value_normalizer is not None:
             advantages = self.critic_buffer.returns[
                 :-1
@@ -23,7 +23,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                 self.critic_buffer.returns[:-1] - self.critic_buffer.value_preds[:-1]
             )
 
-        # normalize advantages for FP
+       
         if self.state_type == "FP":
             active_masks_collector = [
                 self.actor_buffer[i].active_masks for i in range(self.num_agents)
@@ -35,9 +35,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
             std_advantages = np.nanstd(advantages_copy)
             advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
-        # =====================================================================
-        # TAPPO & PRL 开关检查
-        # =====================================================================
+       
         use_action_pred = self.algo_args["algo"].get("use_action_pred", False)
         use_aux_loss = self.algo_args["algo"].get("use_aux_loss", False)
         use_prob_aux_loss = self.algo_args["algo"].get("use_prob_aux_loss", False)
@@ -50,9 +48,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
             joint_actions_input = None
 
         if self.share_param:
-            # ========================
-            # 共享参数模式 (Share Param)
-            # ========================
+           
             if self.state_type == "EP":
                 advantages_ori_list = []
                 advantages_copy_list =[]
@@ -102,7 +98,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                     data_generators.append(data_generator)
 
                 for _ in range(actor_num_mini_batch):
-                    # MAPPO 原生有 8 项。如果有 PRL 增加 1 项 (next_share_obs)，如果有 TAPPO 再增加 1 项
+                    
                     base_len = 8
                     has_share = 1 if need_target_embed else 0
                     has_joint = 1 if use_action_pred else 0
@@ -115,11 +111,11 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                         for i in range(tuple_len):
                             batches[i].append(sample[i])
                             
-                    # 前 7 项是常规 tensor 拼接
+                   
                     for i in range(7):
                         batches[i] = np.concatenate(batches[i], axis=0)
                     
-                    # 第 8 项是 avail_actions，可能为 None
+                   
                     if batches[7][0] is None:
                         batches[7] = None
                     else:
@@ -129,7 +125,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                     target_joint_actions = None
                     current_idx = 8
                     
-                    # === 如果开启 PRL，提取 next_share_obs_batch ===
+                   
                     if need_target_embed:
                         next_share_obs_batch = np.concatenate(batches[current_idx], axis=0)
                         current_idx += 1
@@ -146,12 +142,12 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                                 next_share_obs_batch, dummy_rnn, dummy_masks
                             )
                             
-                    # === 如果开启 TAPPO，提取 target_joint_actions ===
+                   
                     if use_action_pred:
                         batches_joint = np.concatenate(batches[current_idx], axis=0)
                         target_joint_actions = torch.tensor(batches_joint).to(self.device)
 
-                    # 前 8 项是给 policy 的基础数据
+                    
                     sample_to_update = tuple(batches[:8])
 
                     policy_loss, dist_entropy, actor_grad_norm, imp_weights, action_pred_loss, aux_loss = self.actor[0].update(
@@ -173,9 +169,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                 actor_train_infos.append(train_info)
 
         else:
-            # ========================
-            # 非共享参数模式
-            # ========================
+           
             for agent_id in range(self.num_agents):
                 train_info = {
                     "policy_loss": 0, "dist_entropy": 0, 
@@ -255,7 +249,7 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                     train_info[k] /= num_updates
                 actor_train_infos.append(train_info)
 
-        # update critic
+        
         critic_train_info = self.critic.train(self.critic_buffer, self.value_normalizer)
 
         return actor_train_infos, critic_train_info

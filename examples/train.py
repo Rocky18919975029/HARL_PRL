@@ -1,11 +1,5 @@
-# harl/examples/train.py
 
 import harl
-print("\n" + "="*50)
-print(f"【终极测谎仪】当前加载的 HARL 包路径是：\n {harl.__file__}")
-print("="*50 + "\n")
-
-
 """Train an algorithm."""
 import argparse
 import json
@@ -68,32 +62,32 @@ def main():
         except:
             return arg
 
-    keys = [k[2:] for k in unparsed_args[0::2]]  # remove -- from argument
+    keys = [k[2:] for k in unparsed_args[0::2]] 
     values = [process(v) for v in unparsed_args[1::2]]
     unparsed_dict = {k: v for k, v in zip(keys, values)}
-    args = vars(args)  # convert to dict
-    if args["load_config"] != "":  # load config from existing config file
+    args = vars(args) 
+    if args["load_config"] != "": 
         with open(args["load_config"], encoding="utf-8") as file:
             all_config = json.load(file)
         args["algo"] = all_config["main_args"]["algo"]
         args["env"] = all_config["main_args"]["env"]
-        # 👇 === 新增这一行 === 👇
+       
         args["exp_name"] = all_config["main_args"]["exp_name"] 
         algo_args = all_config["algo_args"]
         env_args = all_config["env_args"]
-    else:  # load config from corresponding yaml file
+    else:  
         algo_args, env_args = get_defaults_yaml_args(args["algo"], args["env"])
-    update_args(unparsed_dict, algo_args, env_args)  # update args from command line
+    update_args(unparsed_dict, algo_args, env_args)  
 
     if args["env"] == "dexhands":
-        import isaacgym  # isaacgym has to be imported before PyTorch
+        import isaacgym  
 
-    # note: isaac gym does not support multiple instances, thus cannot eval separately
+    
     if args["env"] == "dexhands":
         algo_args["eval"]["use_eval"] = False
         algo_args["train"]["episode_length"] = env_args["hands_episode_length"]
 
-    # start training
+   
     from harl.runners import RUNNER_REGISTRY
 
     runner = RUNNER_REGISTRY[args["algo"]](args, algo_args, env_args)

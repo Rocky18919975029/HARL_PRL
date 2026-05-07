@@ -1,4 +1,4 @@
-# harl/runners/on_policy_base_runner.py
+
 
 """Base runner for on-policy algorithms."""
 
@@ -7,7 +7,7 @@ import os
 import numpy as np
 import torch
 import setproctitle
-from tqdm import tqdm  # ===【新增】: 进度条
+from tqdm import tqdm  
 from harl.common.valuenorm import ValueNorm
 from harl.common.buffers.on_policy_actor_buffer import OnPolicyActorBuffer
 from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferEP
@@ -50,7 +50,7 @@ class OnPolicyBaseRunner:
         self.fixed_order = algo_args["algo"]["fixed_order"]
         set_seed(algo_args["seed"])
         self.device = init_device(algo_args["device"])
-        if not self.algo_args["render"]["use_render"]:  # train, not render
+        if not self.algo_args["render"]["use_render"]: 
             self.run_dir, self.log_dir, self.save_dir, self.writter = init_dir(
                 args["env"],
                 env_args,
@@ -60,13 +60,13 @@ class OnPolicyBaseRunner:
                 logger_path=algo_args["logger"]["log_dir"],
             )
             save_config(args, algo_args, env_args, self.run_dir)
-        # set the title of the process
+       
         setproctitle.setproctitle(
             str(args["algo"]) + "-" + str(args["env"]) + "-" + str(args["exp_name"])
         )
 
-        # set the config of env
-        if self.algo_args["render"]["use_render"]:  # make envs for rendering
+      
+        if self.algo_args["render"]["use_render"]: 
             (
                 self.envs,
                 self.manual_render,
@@ -74,7 +74,7 @@ class OnPolicyBaseRunner:
                 self.manual_delay,
                 self.env_num,
             ) = make_render_env(args["env"], algo_args["seed"]["seed"], env_args)
-        else:  # make envs for training and evaluation
+        else: 
             self.envs = make_train_env(
                 args["env"],
                 algo_args["seed"]["seed"],
@@ -97,19 +97,19 @@ class OnPolicyBaseRunner:
         print("observation_space: ", self.envs.observation_space)
         print("action_space: ", self.envs.action_space)
 
-        # === 【增量修改 1】：计算全局动作空间总维度，供 Action Pred Head 使用 ===
+       
         from harl.utils.envs_tools import get_shape_from_act_space
         total_action_dim = sum([get_shape_from_act_space(self.envs.action_space[i]) for i in range(self.num_agents)])
         algo_args["algo"]["total_action_dim"] = total_action_dim
         
-        # === 【增量修改 2】：把 num_agents 塞进配置里，供 MAGPO 使用 ===
+       
         algo_args["algo"]["num_agents"] = self.num_agents
 
-        # actor
+        
         if self.share_param:
             self.actor = []
             agent = ALGO_REGISTRY[args["algo"]](
-                {**algo_args["model"], **algo_args["algo"]}, # <--- 这里会自动带着 num_agents 传给 magpo.py
+                {**algo_args["model"], **algo_args["algo"]},
                 self.envs.observation_space[0],
                 self.envs.action_space[0],
                 device=self.device,
@@ -135,7 +135,7 @@ class OnPolicyBaseRunner:
                 )
                 self.actor.append(agent)
 
-        if self.algo_args["render"]["use_render"] is False:  # train, not render
+        if self.algo_args["render"]["use_render"] is False:  
             self.actor_buffer = []
             for agent_id in range(self.num_agents):
                 ac_bu = OnPolicyActorBuffer(
@@ -165,13 +165,12 @@ class OnPolicyBaseRunner:
             else:
                 raise NotImplementedError
 
-            # =========================================================================
-            # === 【新增：MAGPO / CTDS 的集中式导师网络 (Guider)】 ===
-            # =========================================================================
+           
+
             self.use_guider = algo_args["algo"].get("use_guider", False)
 
             if self.use_guider:
-                # 动态选择使用 MAT 还是 Sable 作为 Guider
+                
                 guider_type = algo_args["algo"].get("guider_type", "sable").lower()
                 
                 if guider_type == "mat":
@@ -181,7 +180,7 @@ class OnPolicyBaseRunner:
                     from harl.models.policy_models.ar_guider_sable import ARGuiderPolicySable
                     GuiderClass = ARGuiderPolicySable
                 
-                # 初始化单体全局自回归策略
+               
                 self.guider = GuiderClass(
                     {**algo_args["model"], **algo_args["algo"]},
                     share_obs_space=self.envs.share_observation_space[0],
@@ -190,7 +189,7 @@ class OnPolicyBaseRunner:
                     device=self.device,
                 )
                 
-                # 为 Guider 配备一个独立的优化器
+                
                 self.guider_optimizer = torch.optim.Adam(
                     self.guider.parameters(),
                     lr=algo_args["model"]["lr"],
@@ -208,7 +207,7 @@ class OnPolicyBaseRunner:
                 args, algo_args, env_args, self.num_agents, self.writter, self.run_dir
             )
             
-        # === 【新增】：断点重续的全局起始 episode ===
+        
         self.start_episode = 1
         if self.algo_args["train"]["model_dir"] is not None:  # restore model
             self.restore()
@@ -222,10 +221,8 @@ class OnPolicyBaseRunner:
         print("start running")
         self.warmup()
 
-        # ==========================================
-        # === 【新增：记录训练开始时间】 ===
-        # ==========================================
-        import time # 确保顶部或者这里 import 了 time
+        
+        import time
         train_start_time = time.time()
 
         episodes = (
@@ -234,31 +231,31 @@ class OnPolicyBaseRunner:
             // self.algo_args["train"]["n_rollout_threads"]
         )
 
-        self.logger.init(episodes)  # logger callback at the beginning of training
+        self.logger.init(episodes)  
 
-        # ===【新增】: 进度条 (从 start_episode 到 episodes) ===
+        
         pbar = tqdm(total=episodes, initial=self.start_episode - 1, desc="Training")
 
         for episode in range(self.start_episode, episodes + 1):
             if self.algo_args["train"][
                 "use_linear_lr_decay"
-            ]:  # linear decay of learning rate
+            ]:  
                 if self.share_param:
                     self.actor[0].lr_decay(episode, episodes)
                 else:
                     for agent_id in range(self.num_agents):
                         self.actor[agent_id].lr_decay(episode, episodes)
                 self.critic.lr_decay(episode, episodes)
-                # ===【补充 Guider 的衰减】===
+                
                 if getattr(self, "use_guider", False):
                     from harl.utils.models_tools import update_linear_schedule
                     update_linear_schedule(self.guider_optimizer, episode, episodes, self.algo_args["model"]["lr"])
 
-            self.logger.episode_init(episode)  # logger callback at the beginning of each episode
+            self.logger.episode_init(episode) 
 
-            self.prep_rollout()  # change to eval mode
+            self.prep_rollout() 
             for step in range(self.algo_args["train"]["episode_length"]):
-                # Sample actions from actors and values from critics
+                
                 (
                     values,
                     actions,
@@ -266,7 +263,7 @@ class OnPolicyBaseRunner:
                     rnn_states,
                     rnn_states_critic,
                 ) = self.collect(step)
-                # actions: (n_threads, n_agents, action_dim)
+               
                 (
                     obs,
                     share_obs,
@@ -289,53 +286,52 @@ class OnPolicyBaseRunner:
                     rnn_states_critic,
                 )
 
-                self.logger.per_step(data)  # logger callback at each step
-                self.insert(data)  # insert data into buffer
+                self.logger.per_step(data)  
+                self.insert(data) 
 
-            # compute return and update network
+            
             self.compute()
-            self.prep_training()  # change to train mode
+            self.prep_training()  
 
             actor_train_infos, critic_train_info = self.train()
 
-            # ===【修改】: 收集并打印 Aux Loss 和 Act Pred Loss ===
-            # 由于存在多个 agent，我们取平均值来展示
+           
             aux_losses = []
             action_pred_losses = []
             
             for agent_id in range(self.num_agents):
-                # 收集 aux_loss
+               
                 if "aux_loss" in actor_train_infos[agent_id]:
                     aux_losses.append(actor_train_infos[agent_id]["aux_loss"])
-                # 收集 action_pred_loss
+                
                 if "action_pred_loss" in actor_train_infos[agent_id]:
                     action_pred_losses.append(actor_train_infos[agent_id]["action_pred_loss"])
             
             pbar_postfix = {}
-            # 计算当前的全局步数：episode * episode_length * n_rollout_threads
+           
             current_steps = (
                 episode 
                 * self.algo_args["train"]["episode_length"] 
                 * self.algo_args["train"]["n_rollout_threads"]
             )
 
-            # 处理 Aux Loss
+           
             if len(aux_losses) > 0 and np.mean(aux_losses) != 0.0:
                 avg_aux_loss = np.mean(aux_losses)
                 pbar_postfix["Aux Loss"] = f"{avg_aux_loss:.4f}"
                 self.writter.add_scalar("avg_aux_loss", avg_aux_loss, current_steps)
                 
-            # 处理 Action Pred Loss
+            
             if len(action_pred_losses) > 0 and np.mean(action_pred_losses) != 0.0:
                 avg_act_pred_loss = np.mean(action_pred_losses)
                 pbar_postfix["Act Pred"] = f"{avg_act_pred_loss:.4f}"
                 self.writter.add_scalar("avg_action_pred_loss", avg_act_pred_loss, current_steps)
 
-            # 更新 tqdm 进度条的后缀显示
+           
             if pbar_postfix:
                 pbar.set_postfix(pbar_postfix)
 
-            # log information (将打印到 Tensorboard 等)
+           
             if episode % self.algo_args["train"]["log_interval"] == 0:
                 self.logger.episode_log(
                     actor_train_infos,
@@ -344,14 +340,13 @@ class OnPolicyBaseRunner:
                     self.critic_buffer,
                 )
 
-            # eval
+           
             if episode % self.algo_args["train"]["eval_interval"] == 0:
                 if self.algo_args["eval"]["use_eval"]:
                     self.prep_rollout()
                     self.eval()
             
-            # === 【修复】：将保存逻辑独立出来 ===
-            # 如果满足 eval_interval，或者满足 save_backup_interval，就调用 save
+            
             save_backup_interval = self.algo_args["train"].get("save_backup_interval", 100)
             if (episode % self.algo_args["train"]["eval_interval"] == 0) or \
                (episode % save_backup_interval == 0):
@@ -359,18 +354,16 @@ class OnPolicyBaseRunner:
 
             self.after_update()
             
-            # ===【新增】: 进度条步进 ===
+           
             pbar.update(1)
 
         pbar.close()
 
-        # ==========================================
-        # === 【新增：计算并保存总训练时长】 ===
-        # ==========================================
+        
         train_end_time = time.time()
         total_time_sec = train_end_time - train_start_time
         
-        # 格式化为 小时:分钟:秒
+       
         hours, rem = divmod(total_time_sec, 3600)
         minutes, seconds = divmod(rem, 60)
         time_str = f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
@@ -378,7 +371,7 @@ class OnPolicyBaseRunner:
         print(f"\n🎉 Training Pipeline Finished!")
         print(f"⏱️  Total Training Time: {time_str}")
         
-        # 将时间写入一个单独的 txt 文件，保存在 log_dir 下，防止清屏后找不到
+        
         time_log_path = os.path.join(self.run_dir, "training_time.txt")
         with open(time_log_path, "w") as f:
             f.write(f"Start Episode: {self.start_episode}\n")
@@ -388,9 +381,9 @@ class OnPolicyBaseRunner:
 
     def warmup(self):
         """Warm up the replay buffer."""
-        # reset env
+       
         obs, share_obs, available_actions = self.envs.reset()
-        # replay buffer
+       
         for agent_id in range(self.num_agents):
             self.actor_buffer[agent_id].obs[0] = obs[:, agent_id].copy()
             if self.actor_buffer[agent_id].available_actions is not None:
@@ -406,28 +399,27 @@ class OnPolicyBaseRunner:
     def collect(self, step):
         """Collect actions and values from actors and critics."""
         if self.use_guider:
-            # 1. 拿到当前的全局状态 (share_obs)
+           
             current_share_obs = self.critic_buffer.share_obs[step]
             if self.state_type == "FP":
                 current_share_obs = np.concatenate(current_share_obs)
 
-            # 2. 准备 available_actions
+           
             available_actions = None
             if self.actor_buffer[0].available_actions is not None:
                 avail_acts = [self.actor_buffer[i].available_actions[step] for i in range(self.num_agents)]
-                available_actions = np.stack(avail_acts, axis=1) # [Batch, N, Dim]
+                available_actions = np.stack(avail_acts, axis=1)
 
-            # 3. 使用 Guider 一次性自回归生成所有 Agent 的动作
-            # 这里的 get_actions 就是我们在 ar_guider_sable 里写的 O(N) 循环
+           
             actions_pt, action_log_probs_pt = self.guider.get_actions(
                 current_share_obs, available_actions, deterministic=False
             )
             
-            # 4. Guider 返回的已经是完美的 [Batch, Num_Agents, Dim]，绝对不要转置！
+           
             actions = _t2n(actions_pt)
             action_log_probs = _t2n(action_log_probs_pt)
             
-            # Dummy RNN State 必须与上面保持一致，即 [Batch, Num_Agents, 1, Hidden_Dim]
+            
             rnn_states = np.zeros(
                 (self.algo_args["train"]["n_rollout_threads"], self.num_agents, self.recurrent_n, self.rnn_hidden_size),
                 dtype=np.float32
@@ -567,7 +559,7 @@ class OnPolicyBaseRunner:
     @torch.no_grad()
     def eval(self):
         """Evaluate the model."""
-        self.logger.eval_init()  # logger callback at the beginning of evaluation
+        self.logger.eval_init() 
         eval_episode = 0
 
         eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
@@ -587,31 +579,27 @@ class OnPolicyBaseRunner:
         )
 
         while True:
-            # =================================================================
-            # === 【修复：MAT / Sable 必须使用中心化的 Guider 进行评估】 ===
-            # =================================================================
+           
             if self.args["algo"] in ["mat", "sable"]:
                 current_share_obs = eval_share_obs
                 if self.state_type == "FP":
                     current_share_obs = np.concatenate(current_share_obs)
                 
-                # 准备 available_actions
+               
                 available_actions = None
                 if eval_available_actions[0] is not None:
                     avail_acts = [eval_available_actions[:, i] for i in range(self.num_agents)]
                     available_actions = np.stack(avail_acts, axis=1) # [Batch, N, Dim]
 
-                # 调用 Guider 进行自回归解码
+                
                 actions_pt, _ = self.guider.get_actions(
                     current_share_obs, available_actions, deterministic=True
                 )
                 
-                # 转成 Numpy 并调整维度给环境 [N, Batch, Dim]
+                
                 eval_actions = _t2n(actions_pt).transpose(1, 0, 2)
                 
-            # =================================================================
-            # === 【MAGPO, CTDS, HAPPO, MAPPO 依然使用去中心化的 Actor】 ===
-            # =================================================================
+           
             else:
                 eval_actions_collector = []
                 for agent_id in range(self.num_agents):
@@ -647,13 +635,13 @@ class OnPolicyBaseRunner:
             )
             self.logger.eval_per_step(
                 eval_data
-            )  # logger callback at each step of evaluation
+            )  
 
             eval_dones_env = np.all(eval_dones, axis=1)
 
             eval_rnn_states[
                 eval_dones_env == True
-            ] = np.zeros(  # if env is done, then reset rnn_state to all zero
+            ] = np.zeros( 
                 (
                     (eval_dones_env == True).sum(),
                     self.num_agents,
@@ -676,12 +664,12 @@ class OnPolicyBaseRunner:
                     eval_episode += 1
                     self.logger.eval_thread_done(
                         eval_i
-                    )  # logger callback when an episode is done
+                    )  
 
             if eval_episode >= self.algo_args["eval"]["eval_episodes"]:
                 self.logger.eval_log(
                     eval_episode
-                )  # logger callback at the end of evaluation
+                )  
                 break
 
     @torch.no_grad()
@@ -689,7 +677,7 @@ class OnPolicyBaseRunner:
         """Render the model."""
         print("start rendering")
         if self.manual_expand_dims:
-            # this env needs manual expansion of the num_of_parallel_envs dimension
+            
             for _ in range(self.algo_args["render"]["render_episodes"]):
                 eval_obs, _, eval_available_actions = self.envs.reset()
                 eval_obs = np.expand_dims(np.array(eval_obs), axis=0)
@@ -749,8 +737,7 @@ class OnPolicyBaseRunner:
                         print(f"total reward of this episode: {rewards}")
                         break
         else:
-            # this env does not need manual expansion of the num_of_parallel_envs dimension
-            # such as dexhands, which instantiates a parallel env of 64 pair of hands
+            
             for _ in range(self.algo_args["render"]["render_episodes"]):
                 eval_obs, _, eval_available_actions = self.envs.reset()
                 eval_rnn_states = np.zeros(
@@ -797,33 +784,33 @@ class OnPolicyBaseRunner:
                     if eval_dones[0][0]:
                         print(f"total reward of this episode: {rewards}")
                         break
-        if "smac" in self.args["env"]:  # replay for smac, no rendering
+        if "smac" in self.args["env"]: 
             if "v2" in self.args["env"]:
                 self.envs.env.save_replay()
             else:
                 self.envs.save_replay()
 
-    # === 【找回的方法：准备推断/评估】 ===
+   
     def prep_rollout(self):
         """Prepare for rollout."""
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_rollout()
         self.critic.prep_rollout()
-        # ===【补充切换 Guider】===
+       
         if getattr(self, "use_guider", False):
             self.guider.eval()
 
-    # === 【找回的方法：准备训练】 ===
+   
     def prep_training(self):
         """Prepare for training."""
         for agent_id in range(self.num_agents):
             self.actor[agent_id].prep_training()
         self.critic.prep_training()
-        # ===【补充切换 Guider】===
+       
         if getattr(self, "use_guider", False):
             self.guider.train()
 
-    # === 【新重构的保存方法】 ===
+   
     def save(self, episode=None):
         """Save model parameters.
         Args:
@@ -831,36 +818,36 @@ class OnPolicyBaseRunner:
         """
         save_backup_interval = self.algo_args["train"].get("save_backup_interval", 100)
         
-        # 1. 准备全局综合状态字典
+       
         checkpoint = {
             "episode": episode,
             "actors": {},
             "critic_state_dict": self.critic.critic.state_dict(),
             "critic_optimizer_state_dict": self.critic.critic_optimizer.state_dict()
         }
-        # ===【补充保存 Guider】===
+       
         if getattr(self, "use_guider", False):
             checkpoint["guider_state_dict"] = self.guider.state_dict()
             checkpoint["guider_optimizer_state_dict"] = self.guider_optimizer.state_dict()
 
-        # 2. 收集每个 Actor 的状态 (利用我们在 on_policy_base.py 中加的 get_checkpoint)
+        
         for agent_id in range(self.num_agents):
             checkpoint["actors"][f"agent_{agent_id}"] = self.actor[agent_id].get_checkpoint()
 
-        # 3. 收集 value normalizer (如果用了的话)
+      
         if self.value_normalizer is not None:
             checkpoint["value_normalizer_state_dict"] = self.value_normalizer.state_dict()
 
-        # 4. 始终保存一份 latest.pt
+       
         latest_path = os.path.join(self.save_dir, "latest.pt")
         torch.save(checkpoint, latest_path)
 
-        # 5. 每隔 m 步保存一份 backup
+       
         if episode is not None and episode % save_backup_interval == 0:
             backup_path = os.path.join(self.save_dir, f"backup_ep{episode}.pt")
             torch.save(checkpoint, backup_path)
             
-        # 为了向后兼容，也保留原来那种零散的 pt 文件 (给 render 使用)
+       
         for agent_id in range(self.num_agents):
             torch.save(
                 self.actor[agent_id].actor.state_dict(),
@@ -875,40 +862,40 @@ class OnPolicyBaseRunner:
                 str(self.save_dir) + "/value_normalizer" + ".pt",
             )
 
-    # === 【新重构的加载方法：支持完美断点重续】 ===
+   
     def restore(self):
         """Restore model parameters for perfect resume or rendering."""
         model_dir = str(self.algo_args["train"]["model_dir"])
         
-        # 尝试寻找综合的 checkpoint 文件 (优先加载 latest.pt)
+        
         latest_path = os.path.join(model_dir, "latest.pt")
         
         if os.path.exists(latest_path) and not self.algo_args["render"]["use_render"]:
             print(f"==> Resuming perfectly from {latest_path}")
             checkpoint = torch.load(latest_path, map_location=self.device)
             
-            # 恢复当前轮数
+           
             self.start_episode = checkpoint.get("episode", 0) + 1
             
-            # 恢复 Actors 和 Actor Optimizers
+           
             for agent_id in range(self.num_agents):
                 self.actor[agent_id].load_checkpoint(checkpoint["actors"][f"agent_{agent_id}"])
                 
-            # 恢复 Critic 和 Critic Optimizer
+           
             self.critic.critic.load_state_dict(checkpoint["critic_state_dict"])
             self.critic.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
 
-            # ===【补充加载 Guider】===
+           
             if getattr(self, "use_guider", False) and "guider_state_dict" in checkpoint:
                 self.guider.load_state_dict(checkpoint["guider_state_dict"])
                 self.guider_optimizer.load_state_dict(checkpoint["guider_optimizer_state_dict"])
             
-            # 恢复 Value Normalizer
+           
             if self.value_normalizer is not None and "value_normalizer_state_dict" in checkpoint:
                 self.value_normalizer.load_state_dict(checkpoint["value_normalizer_state_dict"])
                 
         else:
-            # 兼容老版本的纯推理模式加载
+           
             print("==> Resuming from separated .pt files (Legacy Mode / Render Mode)")
             for agent_id in range(self.num_agents):
                 policy_actor_state_dict = torch.load(model_dir + "/actor_agent" + str(agent_id) + ".pt", map_location=self.device)

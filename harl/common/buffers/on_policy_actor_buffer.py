@@ -1,4 +1,4 @@
-# harl/common/buffers/on_policy_actor_buffer.py
+
 
 """On-policy buffer for actor."""
 
@@ -29,13 +29,13 @@ class OnPolicyActorBuffer:
         if isinstance(obs_shape[-1], list):
             obs_shape = obs_shape[:1]
 
-        # Buffer for observations of this actor.
+       
         self.obs = np.zeros(
             (self.episode_length + 1, self.n_rollout_threads, *obs_shape),
             dtype=np.float32,
         )
 
-        # Buffer for rnn states of this actor.
+        
         self.rnn_states = np.zeros(
             (
                 self.episode_length + 1,
@@ -46,7 +46,7 @@ class OnPolicyActorBuffer:
             dtype=np.float32,
         )
 
-        # Buffer for available actions of this actor.
+        
         if act_space.__class__.__name__ == "Discrete":
             self.available_actions = np.ones(
                 (self.episode_length + 1, self.n_rollout_threads, act_space.n),
@@ -57,20 +57,20 @@ class OnPolicyActorBuffer:
 
         act_shape = get_shape_from_act_space(act_space)
 
-        # Buffer for actions of this actor.
+       
         self.actions = np.zeros(
             (self.episode_length, self.n_rollout_threads, act_shape), dtype=np.float32
         )
 
-        # Buffer for action log probs of this actor.
+       
         self.action_log_probs = np.zeros(
             (self.episode_length, self.n_rollout_threads, act_shape), dtype=np.float32
         )
 
-        # Buffer for masks of this actor. Masks denotes at which point should the rnn states be reset.
+        
         self.masks = np.ones((self.episode_length + 1, self.n_rollout_threads, 1), dtype=np.float32)
 
-        # Buffer for active masks of this actor. Active masks denotes whether the agent is alive.
+        
         self.active_masks = np.ones_like(self.masks)
 
         self.factor = None
@@ -114,11 +114,11 @@ class OnPolicyActorBuffer:
             self.available_actions[0] = self.available_actions[-1].copy()
 
     def feed_forward_generator_actor(
-        self, advantages, actor_num_mini_batch=None, mini_batch_size=None, share_obs=None, joint_actions=None
+        self, advantages, actor_num_mini_batch=None, mini_batch_size=None, share_obs=None, joint_actions=None, prl_target="next",  
     ):
         """Training data generator for actor that uses MLP network."""
 
-        # get episode_length, n_rollout_threads, mini_batch_size
+       
         episode_length, n_rollout_threads = self.actions.shape[0:2]
         batch_size = n_rollout_threads * episode_length
         if mini_batch_size is None:
@@ -129,7 +129,7 @@ class OnPolicyActorBuffer:
             )
             mini_batch_size = batch_size // actor_num_mini_batch
 
-        # shuffle indices
+       
         rand = torch.randperm(batch_size).numpy()
         sampler = [
             rand[i * mini_batch_size : (i + 1) * mini_batch_size]
@@ -137,7 +137,7 @@ class OnPolicyActorBuffer:
         ]
 
         obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
-        rnn_states = self.rnn_states[:-1].reshape(-1, *self.rnn_states.shape[2:])  # actually not used, just for consistency
+        rnn_states = self.rnn_states[:-1].reshape(-1, *self.rnn_states.shape[2:])  
         actions = self.actions.reshape(-1, self.actions.shape[-1])
         if self.available_actions is not None:
             available_actions = self.available_actions[:-1].reshape(
@@ -150,13 +150,21 @@ class OnPolicyActorBuffer:
             factor = self.factor.reshape(-1, self.factor.shape[-1])
         advantages = advantages.reshape(-1, 1)
         
-        # === 【新增代码：提取 next_share_obs】 ===
+       
         if share_obs is not None:
-            # 取 1 到 最后，即为 t+1 时刻的全局状态
-            next_share_obs = share_obs[1:].reshape(-1, *share_obs.shape[2:])
-        # === 【增量修改 5】：展平动作 ===
+            if prl_target == "next":
+               
+                target_share_obs = share_obs[1:]
+            elif prl_target == "current":
+                
+                target_share_obs = share_obs[:-1]
+            else:
+                raise ValueError(f"Unsupported prl_target: {prl_target}")
+
+            target_share_obs = target_share_obs.reshape(-1, *share_obs.shape[2:])
+        
         if joint_actions is not None:
-            # joint_actions 是从 actions 拼装来的，长度正好等于 episode_length，【不需要切片】
+            
             flat_joint_actions = joint_actions.reshape(-1, joint_actions.shape[-1])
         for indices in sampler:
             obs_batch = obs[indices]
@@ -182,23 +190,23 @@ class OnPolicyActorBuffer:
             if self.factor is not None:
                 yield_tuple += (factor[indices],)
                 
-            # === 【新增代码：将 next_share_obs 塞进 yield 的结尾】 ===
+            
             if share_obs is not None:
-                yield_tuple += (next_share_obs[indices],)
+                yield_tuple += (target_share_obs[indices],)
 
-            # === 【增量修改 6】：挂载在元组最后 ===
+           
             if joint_actions is not None:
                 yield_tuple += (flat_joint_actions[indices],)
 
             yield yield_tuple
 
-    def naive_recurrent_generator_actor(self, advantages, actor_num_mini_batch, share_obs=None, joint_actions=None):
+    def naive_recurrent_generator_actor(self, advantages, actor_num_mini_batch, share_obs=None, joint_actions=None, prl_target="next"):
         """Training data generator for actor that uses RNN network.
         This generator does not split the trajectories into chunks, 
         and therefore maybe less efficient than the recurrent_generator_actor in training.
         """
 
-        # get n_rollout_threads and num_envs_per_batch
+        
         n_rollout_threads = self.actions.shape[1]
         assert n_rollout_threads >= actor_num_mini_batch, (
             f"The number of processes ({n_rollout_threads}) "
@@ -207,12 +215,12 @@ class OnPolicyActorBuffer:
         )
         num_envs_per_batch = n_rollout_threads // actor_num_mini_batch
 
-        # shuffle indices
+       
         perm = torch.randperm(n_rollout_threads).numpy()
 
         T, N = self.episode_length, num_envs_per_batch
 
-        # prepare data for each mini batch
+        
         for batch_id in range(actor_num_mini_batch):
             start_id = batch_id * num_envs_per_batch
             ids = perm[start_id : start_id + num_envs_per_batch]
@@ -238,24 +246,32 @@ class OnPolicyActorBuffer:
                 yield_tuple += (factor_batch,)
 
             if share_obs is not None:
-                next_share_obs_batch = _flatten(T, N, share_obs[1:, ids])
-                yield_tuple += (next_share_obs_batch,)
+               
+                if prl_target == "next":
+                    target_share_obs = share_obs[1:]
+                elif prl_target == "current":
+                    target_share_obs = share_obs[:-1]
+                else:
+                    raise ValueError(f"Unsupported prl_target: {prl_target}")
+
+                target_share_obs_batch = _flatten(T, N, target_share_obs[:, ids])
+                yield_tuple += (target_share_obs_batch,)
                 
-            # === 【新增代码：追加 joint_actions 到元组最末尾】 ===
+           
             if joint_actions is not None:
-                # joint_actions 是从各 actor 的 actions 拼来的，第一维本身就是 episode_length，不需要 [:-1]
+               
                 joint_actions_batch = _flatten(T, N, joint_actions[:, ids])
                 yield_tuple += (joint_actions_batch,)
 
             yield yield_tuple
 
-    def recurrent_generator_actor(self, advantages, actor_num_mini_batch, data_chunk_length, share_obs=None, joint_actions=None):
+    def recurrent_generator_actor(self, advantages, actor_num_mini_batch, data_chunk_length, share_obs=None, joint_actions=None, prl_target="next"):
         """Training data generator for actor that uses RNN network.
         This generator splits the trajectories into chunks of length data_chunk_length, 
         and therefore maybe more efficient than the naive_recurrent_generator_actor in training.
         """
 
-        # get episode_length, n_rollout_threads, and mini_batch_size
+       
         episode_length, n_rollout_threads = self.actions.shape[0:2]
         batch_size = n_rollout_threads * episode_length
         data_chunks = batch_size // data_chunk_length
@@ -266,7 +282,7 @@ class OnPolicyActorBuffer:
         )
         assert data_chunks >= 2, "need larger batch size"
 
-        # shuffle indices
+        
         rand = torch.randperm(data_chunks).numpy()
         sampler = [
             rand[i * mini_batch_size : (i + 1) * mini_batch_size]
@@ -291,16 +307,26 @@ class OnPolicyActorBuffer:
             available_actions = _sa_cast(self.available_actions[:-1])
 
         if share_obs is not None:
-            if len(share_obs.shape) > 3:
-                next_share_obs = share_obs[1:].transpose(1, 0, 2, 3, 4).reshape(-1, *share_obs.shape[2:])
+           
+            if prl_target == "next":
+                target_share_obs_raw = share_obs[1:]
+            elif prl_target == "current":
+                target_share_obs_raw = share_obs[:-1]
             else:
-                next_share_obs = _sa_cast(share_obs[1:])
+                raise ValueError(f"Unsupported prl_target: {prl_target}")
+
+            if len(share_obs.shape) > 3:
+                target_share_obs = target_share_obs_raw.transpose(1, 0, 2, 3, 4).reshape(
+                    -1, *share_obs.shape[2:]
+                )
+            else:
+                target_share_obs = _sa_cast(target_share_obs_raw)
                 
-        # === 【新增代码：预处理 joint_actions】 ===
+        
         if joint_actions is not None:
             joint_actions = _sa_cast(joint_actions)
 
-        # generate mini-batches
+       
         for indices in sampler:
             obs_batch = []
             rnn_states_batch = []
@@ -312,8 +338,8 @@ class OnPolicyActorBuffer:
             adv_targ = []
             factor_batch = []
             
-            next_share_obs_batch = [] if share_obs is not None else None
-            # === 【新增代码】 ===
+            target_share_obs_batch = [] if share_obs is not None else None
+            
             joint_actions_batch = [] if joint_actions is not None else None
 
             for index in indices:
@@ -326,19 +352,19 @@ class OnPolicyActorBuffer:
                 active_masks_batch.append(active_masks[ind : ind + data_chunk_length])
                 old_action_log_probs_batch.append(action_log_probs[ind : ind + data_chunk_length])
                 adv_targ.append(advantages[ind : ind + data_chunk_length])
-                rnn_states_batch.append(rnn_states[ind])  # only the beginning rnn states are needed
+                rnn_states_batch.append(rnn_states[ind])  
                 if self.factor is not None:
                     factor_batch.append(factor[ind : ind + data_chunk_length])
                     
                 if share_obs is not None:
-                    next_share_obs_batch.append(next_share_obs[ind : ind + data_chunk_length])
+                    target_share_obs_batch.append(target_share_obs[ind : ind + data_chunk_length])
                     
-                # === 【新增代码】 ===
+                
                 if joint_actions is not None:
                     joint_actions_batch.append(joint_actions[ind : ind + data_chunk_length])
             
             L, N = data_chunk_length, mini_batch_size
-            # These are all ndarrays of size (data_chunk_length, mini_batch_size, *dim)
+            
             obs_batch = np.stack(obs_batch, axis=1)
             actions_batch = np.stack(actions_batch, axis=1)
             if self.available_actions is not None:
@@ -349,17 +375,17 @@ class OnPolicyActorBuffer:
             active_masks_batch = np.stack(active_masks_batch, axis=1)
             old_action_log_probs_batch = np.stack(old_action_log_probs_batch, axis=1)
             adv_targ = np.stack(adv_targ, axis=1)
-            # rnn_states_batch is a (mini_batch_size, *dim) ndarray
+            
             rnn_states_batch = np.stack(rnn_states_batch).reshape(N, *self.rnn_states.shape[2:])
             
             if share_obs is not None:
-                next_share_obs_batch = np.stack(next_share_obs_batch, axis=1)
+                target_share_obs_batch = np.stack(target_share_obs_batch, axis=1)
                 
-            # === 【新增代码】 ===
+            
             if joint_actions is not None:
                 joint_actions_batch = np.stack(joint_actions_batch, axis=1)
 
-            # flatten the (data_chunk_length, mini_batch_size, *dim) ndarrays to (data_chunk_length * mini_batch_size, *dim)
+           
             obs_batch = _flatten(L, N, obs_batch)
             actions_batch = _flatten(L, N, actions_batch)
             if self.available_actions is not None:
@@ -374,9 +400,9 @@ class OnPolicyActorBuffer:
             adv_targ = _flatten(L, N, adv_targ)
             
             if share_obs is not None:
-                next_share_obs_batch = _flatten(L, N, next_share_obs_batch)
+                target_share_obs_batch = _flatten(L, N, target_share_obs_batch)
                 
-            # === 【新增代码】 ===
+            
             if joint_actions is not None:
                 joint_actions_batch = _flatten(L, N, joint_actions_batch)
 
@@ -389,9 +415,9 @@ class OnPolicyActorBuffer:
                 yield_tuple += (factor_batch,)
                 
             if share_obs is not None:
-                yield_tuple += (next_share_obs_batch,)
+                yield_tuple += (target_share_obs_batch,)
                 
-            # === 【新增代码：追加 joint_actions 到元组最末尾】 ===
+            
             if joint_actions is not None:
                 yield_tuple += (joint_actions_batch,)
 

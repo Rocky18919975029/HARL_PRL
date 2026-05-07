@@ -1,4 +1,3 @@
-# harl/algorithms/actors/mappo.py
 
 """MAPPO algorithm."""
 import numpy as np
@@ -22,10 +21,10 @@ class MAPPO(OnPolicyBase):
         self.use_max_grad_norm = args["use_max_grad_norm"]
         self.max_grad_norm = args["max_grad_norm"]
         
-        # 辅助损失系数
+       
         self.aux_loss_coef = args.get("aux_loss_coef", 1.0)
 
-    # === 【修改签名：新增 target_embedding 参数】 ===
+    
     def update(self, sample, target_embedding=None, target_joint_actions=None):
         """Update actor network."""
         (
@@ -43,7 +42,7 @@ class MAPPO(OnPolicyBase):
         adv_targ = check(adv_targ).to(**self.tpdv)
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
 
-        # 1. 目标特征防爆处理 (与 HAPPO 对齐)
+       
         if target_embedding is not None:
             target_embedding = check(target_embedding).to(**self.tpdv).detach()
             if self.args.get("use_target_norm", False):
@@ -52,7 +51,7 @@ class MAPPO(OnPolicyBase):
         use_action_pred = self.args.get("use_action_pred", False)
         use_aux = target_embedding is not None
         
-        # === 动态调用 StochasticPolicy，传入双开关 ===
+        
         eval_out = self.actor.evaluate_actions(
             obs_batch,
             rnn_states_batch,
@@ -67,11 +66,11 @@ class MAPPO(OnPolicyBase):
         action_log_probs = eval_out[0]
         dist_entropy = eval_out[1]
         
-        # 依据 stochastic_policy 的动态解包逻辑提取预测结果
+        
         predicted_embedding = eval_out[3] if len(eval_out) > 3 else None
         predicted_joint_actions = eval_out[4] if len(eval_out) > 4 else None
 
-        # update actor
+        
         imp_weights = getattr(torch, self.action_aggregation)(
             torch.exp(action_log_probs - old_action_log_probs_batch),
             dim=-1,
@@ -88,7 +87,7 @@ class MAPPO(OnPolicyBase):
         else:
             policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
-        # === 【新增：计算 PRL 的 Aux Loss】 ===
+       
         aux_loss = torch.tensor(0.0).to(**self.tpdv)
         if target_embedding is not None and predicted_embedding is not None:
             if self.args.get("use_prob_aux_loss", False):
@@ -108,7 +107,7 @@ class MAPPO(OnPolicyBase):
                 else:
                     aux_loss = F.mse_loss(predicted_embedding, target_embedding)
 
-        # === 计算 TAPPO 的动作预测 Loss ===
+       
         action_pred_loss = torch.tensor(0.0).to(**self.tpdv)
         if use_action_pred and target_joint_actions is not None and predicted_joint_actions is not None:
             if self.use_policy_active_masks:
@@ -120,7 +119,7 @@ class MAPPO(OnPolicyBase):
 
         action_pred_coef = self.args.get("action_pred_coef", 1.0)
         
-        # === 合并所有的 Loss ===
+       
         policy_loss = policy_action_loss - dist_entropy * self.entropy_coef + action_pred_loss * action_pred_coef + aux_loss * self.aux_loss_coef
 
         self.actor_optimizer.zero_grad()
@@ -133,7 +132,7 @@ class MAPPO(OnPolicyBase):
 
         self.actor_optimizer.step()
 
-        # === 返回值追加 aux_loss ===
+        
         return policy_loss, dist_entropy, actor_grad_norm, imp_weights, action_pred_loss, aux_loss
 
     def train(self, actor_buffer, advantages, state_type):

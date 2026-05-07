@@ -12,6 +12,8 @@ from harl.algorithms.actors.mappo import MAPPO
 from harl.algorithms.actors.magpo import MAGPO
 from harl.algorithms.actors.ctce import CTCE
 
+from harl.algorithms.actors.qmix import QMIX
+
 ALGO_REGISTRY = {
     "happo": HAPPO,
     "hatrpo": HATRPO,
@@ -26,4 +28,5 @@ ALGO_REGISTRY = {
     "magpo": MAGPO,
     "sable": CTCE,
     "mat": CTCE,
+    "qmix": QMIX,
 }

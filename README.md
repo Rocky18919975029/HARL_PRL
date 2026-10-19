@@ -31,6 +31,8 @@ Four of six Final-10 comparisons and five of six normalized-AUC comparisons agai
 
 Five-seed wall-clock measurements show a mean task-wise overhead of 7.6% against HAPPO-Deep (range 1.97–19.76%). At equal observed wall-clock cutoffs, PRL has higher means on all six tasks against HAPPO-Deep, but on four of six against the smaller HAPPO actors. Three-seed coefficient sweeps and stability analyses are included in the paper; some continuous-control tasks show larger mid-training downward fluctuations.
 
+![](assets/main_results_10seeds.png)
+
 ## Quick start
 
 Use Linux and the benchmark-specific simulator dependencies described in [the reproduction guide](docs/reproducibility.md). Install PyTorch for your CUDA version before installing the project:

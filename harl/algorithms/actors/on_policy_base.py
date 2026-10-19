@@ -1,4 +1,4 @@
-# harl/algorithms/actors/on_policy_base.py
+
 
 """Base class for on-policy algorithms."""
 
@@ -16,7 +16,7 @@ class OnPolicyBase:
             act_space: (gym.spaces) action space.
             device: (torch.device) device to use for tensor operations.
         """
-        # save arguments
+
         self.args = args
         self.device = device
         self.tpdv = dict(dtype=torch.float32, device=device)
@@ -30,12 +30,12 @@ class OnPolicyBase:
         self.lr = args["lr"]
         self.opti_eps = args["opti_eps"]
         self.weight_decay = args["weight_decay"]
-        # save observation and action spaces
+
         self.obs_space = obs_space
         self.act_space = act_space
-        # create actor network
+
         self.actor = StochasticPolicy(args, self.obs_space, self.act_space, self.device)
-        # create actor optimizer
+
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(),
             lr=self.lr,
@@ -68,22 +68,16 @@ class OnPolicyBase:
         )
         return actions, action_log_probs, rnn_states_actor
 
-    # 文件路径: harl/algorithms/actors/on_policy_base.py
+
 
     def evaluate_actions(
         self, obs, rnn_states, action, masks, available_actions=None, active_masks=None, return_aux=False, return_action_pred=False
     ):
-        # === 【增量修改 4】：动态解包 5 个返回值 ===
-        (
-            action_log_probs,
-            dist_entropy,
-            action_distribution,
-            predicted_embedding,
-            predicted_joint_actions
-        ) = self.actor.evaluate_actions(
+
+        action_log_probs, dist_entropy, action_distribution, *_ = self.actor.evaluate_actions(
             obs, rnn_states, action, masks, available_actions, active_masks, return_aux=return_aux, return_action_pred=return_action_pred
         )
-        
+
         if return_aux and return_action_pred:
             return action_log_probs, dist_entropy, action_distribution, predicted_embedding, predicted_joint_actions
         elif return_aux:
@@ -134,9 +128,7 @@ class OnPolicyBase:
         """Prepare for rollout."""
         self.actor.eval()
 
-    # ====================================================================
-    # === 【新增】：为了支持完美断点重续，不仅要取 actor，还要取 optimizer
-    # ====================================================================
+
     def get_checkpoint(self):
         """Return the actor and optimizer state dicts for perfect resume."""
         return {

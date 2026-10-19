@@ -1,0 +1,7 @@
+-r core.txt
+# The paper uses legacy Gym -v2 tasks and mujoco-py (MuJoCo 2.1.0).
+gym==0.21.0
+mujoco-py>=2.1.2.14,<2.2
+Cython>=0.29.28,<3
+Jinja2>=3.0.3
+glfw>=2.5.1

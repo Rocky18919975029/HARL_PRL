@@ -84,7 +84,7 @@
     "main_args": {
         "algo": "mappo",
         "env": "mamujoco",
-        "exp_name": "report",
+        "exp_name": "MAPPO_baseline",
         "load_config": ""
     }
 }

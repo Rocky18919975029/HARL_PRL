@@ -1,9 +1,10 @@
+# harl/utils/configs_tools.py
+
 """Tools for loading and updating configs."""
 import time
 import os
 import json
 import yaml
-from uu import Error
 
 
 def get_defaults_yaml_args(algo, env):
@@ -96,7 +97,7 @@ def is_json_serializable(value):
     try:
         json.dumps(value)
         return True
-    except Error:
+    except (TypeError, ValueError):
         return False
 
 

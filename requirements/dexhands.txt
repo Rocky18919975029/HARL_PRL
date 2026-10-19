@@ -1,0 +1,4 @@
+-r core.txt
+# Isaac Gym Preview 4 is installed separately from NVIDIA, before training.
+gym==0.21.0
+numpy==1.23.5

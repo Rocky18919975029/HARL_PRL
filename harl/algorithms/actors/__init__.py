@@ -9,6 +9,10 @@ from harl.algorithms.actors.had3qn import HAD3QN
 from harl.algorithms.actors.maddpg import MADDPG
 from harl.algorithms.actors.matd3 import MATD3
 from harl.algorithms.actors.mappo import MAPPO
+from harl.algorithms.actors.magpo import MAGPO
+from harl.algorithms.actors.ctce import CTCE
+
+from harl.algorithms.actors.qmix import QMIX
 
 ALGO_REGISTRY = {
     "happo": HAPPO,
@@ -21,4 +25,8 @@ ALGO_REGISTRY = {
     "maddpg": MADDPG,
     "matd3": MATD3,
     "mappo": MAPPO,
+    "magpo": MAGPO,
+    "sable": CTCE,
+    "mat": CTCE,
+    "qmix": QMIX,
 }

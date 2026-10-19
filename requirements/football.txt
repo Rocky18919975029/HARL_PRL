@@ -1,0 +1,4 @@
+-r core.txt
+# Google Research Football requires native build dependencies; see docs.
+gym==0.21.0
+gfootball==2.10.2

@@ -84,7 +84,7 @@
     "main_args": {
         "algo": "happo",
         "env": "mamujoco",
-        "exp_name": "report",
+        "exp_name": "HAPPO_baseline",
         "load_config": ""
     }
 }

@@ -5,7 +5,7 @@ import torch.nn as nn
 from harl.utils.envs_tools import check
 from harl.models.base.cnn import CNNBase
 from harl.models.base.mlp import MLPBase
-from harl.models.base.mlp import DeepResNetBase 
+from harl.models.base.mlp import DeepResNetBase
 from harl.models.base.rnn import RNNLayer
 from harl.models.base.act import ACTLayer
 from harl.utils.envs_tools import get_shape_from_obs_space
@@ -26,15 +26,15 @@ class StochasticPolicy(nn.Module):
         self.use_recurrent_policy = args["use_recurrent_policy"]
         self.recurrent_n = args["recurrent_n"]
         self.tpdv = dict(dtype=torch.float32, device=device)
-        
+
 
         obs_shape = get_shape_from_obs_space(obs_space)
         self.use_deep_resnet = args.get("use_deep_resnet", False)
-        
-        # === 【细化开关】：拆分为两个独立的控制变量 ===
+
         self.use_aux_loss = args.get("use_aux_loss", False)
+        self.use_prob_aux_loss = args.get("use_prob_aux_loss", False)
         self.condition_on_pred = args.get("condition_on_pred", False)
-        
+
         if len(obs_shape) == 3:
             self.base = CNNBase(args, obs_shape)
         else:
@@ -58,15 +58,32 @@ class StochasticPolicy(nn.Module):
                 nn.ReLU(),
                 nn.Linear(self.hidden_sizes[-1], self.target_embed_dim)
             )
-            
-            # 只有在明确要求 condition 时，才改变 ACTLayer 的输入维度
+
+            if self.condition_on_pred:
+                combined_dim = self.hidden_sizes[-1] + self.target_embed_dim
+            else:
+                combined_dim = self.hidden_sizes[-1]
+
+        elif self.use_prob_aux_loss:
+            self.target_embed_dim = self.hidden_sizes[-1]
+            self.prob_aux_head_mu = nn.Sequential(
+                nn.Linear(self.hidden_sizes[-1], self.hidden_sizes[-1]),
+                nn.ReLU(),
+                nn.Linear(self.hidden_sizes[-1], self.target_embed_dim)
+            )
+            self.prob_aux_head_logvar = nn.Sequential(
+                nn.Linear(self.hidden_sizes[-1], self.hidden_sizes[-1]),
+                nn.ReLU(),
+                nn.Linear(self.hidden_sizes[-1], self.target_embed_dim)
+            )
+
             if self.condition_on_pred:
                 combined_dim = self.hidden_sizes[-1] + self.target_embed_dim
             else:
                 combined_dim = self.hidden_sizes[-1]
         else:
             combined_dim = self.hidden_sizes[-1]
-        
+
         self.use_action_pred = args.get("use_action_pred", False)
         if self.use_action_pred:
             self.total_action_dim = args["total_action_dim"]
@@ -78,7 +95,7 @@ class StochasticPolicy(nn.Module):
 
         self.act = ACTLayer(
             action_space,
-            combined_dim,  # 根据开关决定是拼接维度还是原始维度
+            combined_dim,
             self.initialization_method,
             self.gain,
             args,
@@ -103,15 +120,22 @@ class StochasticPolicy(nn.Module):
 
         if self.use_aux_loss:
             predicted_embedding = self.aux_head(actor_features)
-            # 只有在明确要求 condition 时，才进行特征拼接
             if self.condition_on_pred:
-                # === 【终极防爆修复】：对齐量纲，防止爆炸 ===
                 detached_pred = predicted_embedding.detach()
-                # 强制归一化，使其标准差为 1，均值为 0，且无学习参数
                 normalized_pred = F.layer_norm(detached_pred, [detached_pred.shape[-1]])
                 combined_features = torch.cat([actor_features, normalized_pred], dim=-1)
             else:
                 combined_features = actor_features
+
+        elif self.use_prob_aux_loss:
+            mu = self.prob_aux_head_mu(actor_features)
+            if self.condition_on_pred:
+                detached_mu = mu.detach()
+                normalized_mu = F.layer_norm(detached_mu, [detached_mu.shape[-1]])
+                combined_features = torch.cat([actor_features, normalized_mu], dim=-1)
+            else:
+                combined_features = actor_features
+
         else:
             combined_features = actor_features
 
@@ -122,8 +146,8 @@ class StochasticPolicy(nn.Module):
         return actions, action_log_probs, rnn_states
 
     def evaluate_actions(
-        self, obs, rnn_states, action, masks, available_actions=None, active_masks=None, 
-        return_aux=False, return_action_pred=False  # === 【修复 1：增加参数】 ===
+        self, obs, rnn_states, action, masks, available_actions=None, active_masks=None,
+        return_aux=False, return_action_pred=False
     ):
         """Compute action log probability, distribution entropy, action distribution, and auxiliary embedding."""
         obs = check(obs).to(**self.tpdv)
@@ -143,18 +167,31 @@ class StochasticPolicy(nn.Module):
         predicted_embedding = None
         if self.use_aux_loss:
             predicted_embedding = self.aux_head(actor_features)
-            # 同样，只在 condition 时拼接特征去算动作的对数概率
             if self.condition_on_pred:
-                # === 【终极防爆修复】：保持前向与评估逻辑一致 ===
                 detached_pred = predicted_embedding.detach()
                 normalized_pred = F.layer_norm(detached_pred, [detached_pred.shape[-1]])
                 combined_features = torch.cat([actor_features, normalized_pred], dim=-1)
             else:
                 combined_features = actor_features
+
+        elif self.use_prob_aux_loss:
+            mu = self.prob_aux_head_mu(actor_features)
+            logvar = self.prob_aux_head_logvar(actor_features)
+
+            logvar = torch.clamp(logvar, min=-10.0, max=2.0)
+
+            predicted_embedding = (mu, logvar)
+
+            if self.condition_on_pred:
+                detached_mu = mu.detach()
+                normalized_mu = F.layer_norm(detached_mu, [detached_mu.shape[-1]])
+                combined_features = torch.cat([actor_features, normalized_mu], dim=-1)
+            else:
+                combined_features = actor_features
+
         else:
             combined_features = actor_features
 
-        # === 【修复 2：删除了错误的拼接，仅做单纯的预测】 ===
         predicted_joint_actions = None
         if self.use_action_pred:
             predicted_joint_actions = self.action_pred_head(actor_features)
@@ -166,7 +203,6 @@ class StochasticPolicy(nn.Module):
             active_masks=active_masks if self.use_policy_active_masks else None,
         )
 
-        # === 【修复 3：动态返回逻辑，完美对齐 Base Actor 的解包】 ===
         if return_aux and return_action_pred:
             return action_log_probs, dist_entropy, action_distribution, predicted_embedding, predicted_joint_actions
         elif return_aux:
@@ -174,4 +210,4 @@ class StochasticPolicy(nn.Module):
         elif return_action_pred:
             return action_log_probs, dist_entropy, action_distribution, None, predicted_joint_actions
         else:
-            return action_log_probs, dist_entropy, action_distribution, None, None
+            return action_log_probs, dist_entropy, action_distribution

@@ -1,317 +1,73 @@
-<div align="center">
-  <img src="./assets/harl_logo.jpg" width="300px" height="auto"/>
-</div>
+# Critic-Guided Predictive Representations for Policy-Gradient Multi-Agent Reinforcement Learning
 
-<h1 align="center"> Heterogeneous-Agent Reinforcement Learning </h1>
+**Zesheng Hong, Xinren Zhang, Jiadong Yu, Pan Hui**
 
-This repository contains the **official implementation** of **Heterogeneous-Agent Reinforcement Learning (HARL)** algorithms, including **HAPPO**, **HATRPO**, **HAA2C**, **HADDPG**, **HATD3**, **HAD3QN**, and **HASAC**, based on PyTorch. ***HARL algorithms are markedly different from MAPPO in that they are generally applicable to heterogeneous agents and are supported by rigorous theories, often achieving superior performance.*** This repository allows researchers and practitioners to easily reproduce our results on seven challenging benchmarks or apply HARL algorithms to their intended applications.
+Predictive Representation Learning (PRL) adds a training-only objective to a decentralized actor: predict the centralized critic's next-state embedding from local information. The prediction head shares the actor encoder, the critic target is detached, and the policy does not consume the prediction. Execution requires only local observations/history.
 
+Built on [HARL](https://github.com/PKU-MARL/HARL). This release contains the paper implementation, six-task experiment configurations and training utilities. The manuscript is a **preprint**, with expanded experiments and corrections integrated from the author response.
 
+## Paper and implementation
 
-## Overview
+- [Training and environment setup](docs/reproducibility.md).
 
-HARL algorithms are our novel solutions to achieving effective multi-agent cooperation in the general *heterogeneous-agent* settings, without relying on the restrictive *parameter-sharing* trick. 
+PRL minimizes a policy-gradient objective plus an auxiliary coefficient times masked prediction MSE. Target normalization is task-specific; exact settings are in the released configurations. HAPPO-Deep uses the same deep residual actor backbone without the auxiliary head/loss. MAPPO-PRL uses the predictive objective with MAPPO updates.
 
-### Key features
+The implemented target controls are **current critic latent** and **joint action** prediction. The latter includes the agent's own action. Earlier labels `Pred_Current_State` and `Pred_Teammate_Action` are retained in configuration names; they do not mean raw-state reconstruction or an exclusively teammate-action target. Post-training probes separately decode global state, teammate actions, and the next critic latent.
 
-- HARL algorithms achieve coordinated agent updates by employing the *sequential update scheme*, different from the *simultaneous update scheme* utilized by MAPPO and MADDPG.
-- HARL algorithms enjoy theoretical guarantees of **monotonic improvement** and **convergence to equilibrium**, ensuring their efficacy in promoting cooperative behavior among agents.
-- Both on-policy and off-policy HARL algorithms, exemplified by **HAPPO** and **HASAC** respectively, demonstrate superior performance across a wide range of benchmarks.
+## Results
 
-The following figure is an illustration of the *sequential update scheme*
-<div align="center">
-  <img src="./assets/maad_sus_8_20_have_white_background.jpg" width="100%"/>
-</div>
+The expanded comparison uses **10 matched seeds per task and method**. Final-10 is the per-run mean of the last ten logged checkpoints. GRF uses score rate; MuJoCo uses evaluation return; Bi-DexHands uses training-rollout reward. Error bars in learning curves are standard deviations, not confidence intervals.
 
-For more details, please refer to our [HARL](https://jmlr.org/papers/v25/23-0488.html) (JMLR 2024) and [MEHARL](https://openreview.net/forum?id=tmqOhBC4a5) (ICLR 2024 spotlight) papers.
+| Task | PRL − HAPPO-Deep, Final-10 | Paired BCa 95% CI | Holm p | Wins |
+|---|---:|---:|---:|---:|
+| GRF 3-vs-1 | +8.97 pp | [−3.01, 17.20] | .2383 | 9/10 |
+| GRF Counterattack | +9.00 pp | [4.53, 13.51] | .0313 | 9/10 |
+| Ant 4×2 | +272.9 | [120.4, 398.4] | .0352 | 8/10 |
+| Humanoid 17×1 | +4682.8 | [2956.4, 5727.2] | .0195 | 9/10 |
+| Walker2d 6×1 | +704.1 | [−99.5, 1498.7] | .2383 | 7/10 |
+| ShadowHandOver | +4.51 | [3.42, 5.60] | .0117 | 10/10 |
 
+Four of six Final-10 comparisons and five of six normalized-AUC comparisons against HAPPO-Deep survive Holm correction. The GRF 3-vs-1 and Walker2d Final-10 differences remain suggestive. Across this fixed six-task suite, PRL wins 52/60 matched pairs against HAPPO-Deep. This evidence does not guarantee improvements on unseen tasks or exact global-state recovery.
 
-## Installation
+Five-seed wall-clock measurements show a mean task-wise overhead of 7.6% against HAPPO-Deep (range 1.97–19.76%). At equal observed wall-clock cutoffs, PRL has higher means on all six tasks against HAPPO-Deep, but on four of six against the smaller HAPPO actors. Three-seed coefficient sweeps and stability analyses are included in the paper; some continuous-control tasks show larger mid-training downward fluctuations.
 
-### Install HARL
+## Quick start
 
-```shell
-conda create -n harl python=3.8
-conda activate harl
-# Install pytorch>=1.9.0 (CUDA>=11.0) manually
-git clone https://github.com/PKU-MARL/HARL.git
-cd HARL
-pip install -e .
+Use Linux and the benchmark-specific simulator dependencies described in [the reproduction guide](docs/reproducibility.md). Install PyTorch for your CUDA version before installing the project:
+
+```bash
+python -m pip install -e .
+python scripts/train_paper.py --list
 ```
 
+The launcher selects the saved paper configuration and exposes task, method, and seed explicitly. Inspect a configuration before starting a full run:
 
-
-### Install Environments Dependencies
-
-Along with HARL algorithms, we also implement the interfaces for seven common environments ([SMAC](https://github.com/oxwhirl/smac), [SMACv2](https://github.com/oxwhirl/smacv2), [MAMuJoCo](https://github.com/schroederdewitt/multiagent_mujoco), [MPE](https://pettingzoo.farama.org/environments/mpe/), [Google Research Football](https://github.com/google-research/football), [Bi-DexterousHands](https://github.com/PKU-MARL/DexterousHands), [Light Aircraft Game](https://github.com/liuqh16/CloseAirCombat)) and they can be used directly. (We also implement the interface for [Gym](https://www.gymlibrary.dev/). Gym is a single-agent environment, which can be seen as a special case of multi-agent environments. It is included mainly for reference purposes.) You may choose to install the dependencies to the environments you want to use. **After the installation, please follow the steps in the ["Solve Dependencies"](https://github.com/PKU-MARL/HARL?tab=readme-ov-file#solve-dependencies) section.**
-
-**Install Dependencies of Bi-DexterousHands**
-
-Bi-DexterousHands depend on IsaacGym. The hardware requirements of IsaacGym has to be satisfied. To install IsaacGym, download IsaacGym Preview 4 release from [its official website](https://developer.nvidia.com/isaac-gym/download). Then run `pip install -e .` under its `python` folder.
-
-**Install Light Aircraft Game**
-
-[Light Aircraft Game](https://github.com/liuqh16/CloseAirCombat) (LAG) is a recently developed cooperative-competitive environment for red and blue aircraft games, offering various settings such as single control, 1v1, and 2v2 scenarios. In the context of multi-agent scenarios, LAG currently supports self-play only for 2v2 settings. To address this limitation, we introduce novel cooperative non-weapon and shoot-missile tasks where two agents collaborate to combat two opponents controlled by the built-in AI. In the non-weapon task, agents are trained to fly towards the opponents' tails while maintaining a suitable distance. In the shoot-missile task, agents learn to dodge opponent missiles and launch their own missiles to destroy the opponents.
-
-To install LAG, run the following command:
-```shell
-# Install dependencies
-pip install torch pymap3d jsbsim==1.1.6 geographiclib gym==0.21.0 wandb icecream setproctitle
-# Initialize submodules(*JSBSim-Team/jsbsim*)
-git submodule init
-git submodule update
+```bash
+python scripts/train_paper.py --task grf_3v1 --method prl --seed 1 --dry-run
+python scripts/train_paper.py --task grf_3v1 --method prl --seed 1
 ```
 
-**Install Google Research Football**
+Use seeds 1–10 for the expanded main comparison and the same seeds for each baseline. Full experiments require hours per run; installing this repository does not install proprietary simulator components. The guide lists task identifiers, evaluation metrics, budgets, ablations, and tests.
 
-Please follow [the official instructions](https://github.com/google-research/football) to install Google Research Football.
+## Repository layout
 
-**Install SMAC**
-
-Please follow [the official instructions](https://github.com/oxwhirl/smac) to install SMAC. We use StarCraft II version 4.10 on Linux.
-
-**Install SMACv2**
-
-Please follow [the official instructions](https://github.com/oxwhirl/smacv2) to install SMACv2.
-
-**Install MPE**
-
-```shell
-pip install pettingzoo==1.22.2
-pip install supersuit==3.7.0
+```text
+harl/                  actor–critic training, buffers, environments
+tuned_configs/         task and method configurations
+scripts/               paper experiment launcher and validation
+docs/                  installation and reproduction details
 ```
-
-**Install Gym Suite (Except MuJoCo)**
-
-```shell
-# Install gym
-pip install gym
-# Install classic control
-pip install gym[classic_control]
-# Install box2d
-conda install -c anaconda swig
-pip install gym[box2d]
-# Install atari
-pip install --upgrade pip setuptools wheel
-pip install opencv-python
-pip install atari-py
-pip install gym[atari]
-pip install autorom[accept-rom-license]
-```
-
-**Install MuJoCo**
-
-First, follow the instructions on https://github.com/openai/mujoco-py, https://www.roboti.us/, and https://github.com/deepmind/mujoco to download the right version of mujoco you need.
-
-Second, `mkdir ~/.mujoco`.
-
-Third, move the .tar.gz or .zip to `~/.mujoco`, and extract it using `tar -zxvf` or `unzip`.
-
-Fourth, add the following line to the `.bashrc`:
-
-```shell
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/<user>/.mujoco/<folder-name, e.g. mujoco210, mujoco-2.2.1>/bin
-```
-
-Fifth, run the following command:
-
-```shell
-sudo apt install libosmesa6-dev libgl1-mesa-glx libglfw3
-pip install mujoco
-pip install gym[mujoco]
-sudo apt-get update -y
-sudo apt-get install -y patchelf
-```
-
-**Install Dependencies of MAMuJoCo**
-
-First follow the instructions above to install MuJoCo. Then run the following commands.
-
-```shell
-pip install "mujoco-py>=2.1.2.14"
-pip install "Jinja2>=3.0.3"
-pip install "glfw>=2.5.1"
-pip install "Cython>=0.29.28"
-```
-
-Note that [mujoco-py](https://github.com/openai/mujoco-py) is compatible with `mujoco210` (see [this](https://github.com/openai/mujoco-py#install-mujoco)). So please make sure to download `mujoco210` and extract it into the right place.
-
-
-
-### Solve Dependencies
-
-After the installation above, run the following commands to solve dependencies.
-
-```shell
-pip install gym==0.21.0
-pip install pyglet==1.5.0
-pip install importlib-metadata==4.13.0
-```
-
-If you encounter issues when using `pip install gym==0.21.0`, try using the following command instead:
-
-```
-conda install -c conda-forge gym=0.21.0
-```
-
-
-
-
-## Usage
-
-### Training on Existing Environments
-
-To train an algorithm on a provided environment, users can modify yaml configuration files of the corresponding algorithm and environment under `harl/configs/algos_cfgs` and `harl/configs/envs_cfgs` as they wish, go to `examples` folder, and then start training with a one-liner `python train.py --algo <ALGO> --env <ENV> --exp_name <EXPERIMENT NAME>` or `python train.py --load_config <CONFIG FILE PATH> --exp_name <EXPERIMENT NAME>`, where the latter is mostly used when reproducing an experiment. We provide the **tuned configurations** for algorithms in each environments under `tuned_configs` folder. Users can **reproduce our results** by using `python train.py --load_config <TUNED CONFIG PATH> --exp_name <EXPERIMENT NAME>` and change `<TUNED CONFIG PATH>` to the absolute path of the tuned config file on their machine.
-
-During training, users receive continuous logging feedback in the terminal.
-
-After training, users can check the log file, tensorboard output, experiment configuration, and saved models under the generated `results` folder. Moreover, users can also render the trained models by setting `use_render: True`, `model_dir: <path to trained models>` in algorithm configuration file (for football users also need to set `render: True` in the environment configuration file), and use the same training command as above again. For SMAC and SMACv2, rendering comes in the form of video replay automatically saved to the `StarCraftII/Replays` folder (more details can be found [here](https://github.com/oxwhirl/smac#saving-and-watching-starcraft-ii-replays)).
-
-To enable batch running, we allow users to modify yaml configs in the command line. For each training command, users specify the special parameters in the commands with the same names as in the config files. For example, if you want to run HAPPO on SMAC tasks under three random seeds. You can customize the configs and replace `train.sh` with the following commands:
-
-```shell
-for seed in $(seq 1 3)
-do
-	python train.py --algo happo --env smac --exp_name test --seed $seed
-done
-```
-
-
-
-### Applying to New Environments
-
-If you want to apply HA series algorithms to solve new tasks, you need to implement environment interfaces, following the examples of the seven environments provided. A simplest interface may look like:
-
-```python
-class Env:
-    def __init__(self, args):
-        self.env = ...
-        self.n_agents = ...
-        self.share_observation_space = ...
-        self.observation_space = ...
-        self.action_space = ...
-
-    def step(self, actions):
-        return obs, state, rewards, dones, info, available_actions
-
-    def reset(self):
-        return obs, state, available_actions
-
-    def seed(self, seed):
-        pass
-
-    def render(self):
-        pass
-
-    def close(self):
-        self.env.close()
-```
-
-The purpose of interface is to *hide environment-specific details and expose a unified interaction protocol, so that other modules could process data uniformly*.
-
-You may also want to produce continuous logging output during training. If you intend to use an on-policy algorithm, you need to implement a logger for your environment. The simplest logger can inherit from `BaseLogger` in `harl/common/base_logger.py` and implement the `get_task_name` function. More customised logging requirements can be fulfilled by extending or overriding more functions. We recommend referring to the existing loggers in each environment directory to get to know how it is written. If an off-policy algorithm is used, you can directly customise logging by modifying the off-policy runner code. In the end, please register the logger (if any), add a yaml config file, and add necessary code to `examples/train.py`, `harl/utils/configs_tool.py`, and `harl/utils/envs_tool.py`. Again, following the existing seven environment examples will be convenient.
-
-After these steps, you can apply the algorithms immediately as above.
-
-
-
-### Application Scope of Algorithms
-
-|        | Continuous action space | Discrete action space | Multi Discrete action space |
-| :----: | :---------------------: | :-------------------: | :-------------------------: |
-| HAPPO  |            √            |           √           |              √              |
-| HATRPO |            √            |           √           |                             |
-| HAA2C  |            √            |           √           |              √              |
-| HADDPG |            √            |                       |                             |
-| HATD3  |            √            |                       |                             |
-| HAD3QN |                         |           √           |                             |
-| HASAC  |            √            |           √           |              √              |
-| MAPPO  |            √            |           √           |              √              |
-| MADDPG |            √            |                       |                             |
-| MATD3  |            √            |                       |                             |
-
-
-
-## Performance on Cooperative MARL Benchmarks
-
-### MPE
-
-<div align="center">
-  <img src="./assets/mpe_learning_curve.jpg" width="100%"/>
-</div>
-
-### MAMuJoCo
-
-HAPPO, HADDPG, and HATD3 outperform MAPPO, MADDPG, and MATD3; HAPPO and HATD3 are the most effective methods for heterogeneous-agent cooperation tasks.
-
-<div align="center">
-  <img src="./assets/mamujoco_on_policy_learning_curve.jpg" width="100%"/>
-</div>
-
-<div align="center">
-  <img src="./assets/mamujoco_off_policy_learning_curve.jpg" width="100%"/>
-</div>
-<div align="center">
-  <img src="./assets/Humanoid-v2_17x1_learning_curve.jpg" width="40%"/>
-</div>
-
-### SMAC & SMACv2
-
-HAPPO and HATRPO are comparable to or better than MAPPO and QMIX in SMAC and SMACv2, demonstrating their capability in mostly homogeneous-agent settings.
-
-<div align="center">
-  <img src="./assets/smac-winrates.png" width="100%"/>
-</div>
-
-<div align="center">
-  <img src="./assets/smac_learning_curve.jpg" width="100%"/>
-</div>
-
-### GRF
-
-HAPPO consistently outperforms MAPPO and QMIX on GRF, and the performance gap increases as the number and heterogeneity of agents increase.
-
-<div align="center">
-  <img src="./assets/grf-scorerates.png" width="50%"/>
-</div>
-<div align="center">
-  <img src="./assets/football_learning_curve.jpg" width="100%"/>
-</div>
-
-### Bi-DexterousHands
-
-HAPPO consistently outperforms MAPPO, and is also better than the single-agent baseline PPO, while also showing less variance.
-
-<div align="center">
-  <img src="./assets/dexhands_learning_curve.jpg" width="100%"/>
-</div>
-
-*The experiment results of HASAC can be found at https://sites.google.com/view/meharl*
 
 ## Citation
 
-This repository is affiliated with [Peking University](https://www.pku.edu.cn//) and [BIGAI](https://www.bigai.ai/). If you find our paper or this repository helpful in your research or project, please consider citing our works using the following BibTeX citation:
-
-```tex
-@article{JMLR:v25:23-0488,
-  author  = {Yifan Zhong and Jakub Grudzien Kuba and Xidong Feng and Siyi Hu and Jiaming Ji and Yaodong Yang},
-  title   = {Heterogeneous-Agent Reinforcement Learning},
-  journal = {Journal of Machine Learning Research},
-  year    = {2024},
-  volume  = {25},
-  number  = {32},
-  pages   = {1--67},
-  url     = {http://jmlr.org/papers/v25/23-0488.html}
+```bibtex
+@misc{hong2026criticguided,
+  title={Critic-Guided Predictive Representations for Policy-Gradient Multi-Agent Reinforcement Learning},
+  author={Hong, Zesheng and Zhang, Xinren and Yu, Jiadong and Hui, Pan},
+  year={2026},
+  note={Preprint},
+  url={https://github.com/Rocky18919975029/HARL_PRL}
 }
 ```
 
-```tex
-@inproceedings{
-liu2024maximum,
-title={Maximum Entropy Heterogeneous-Agent Reinforcement Learning},
-author={Jiarong Liu and Yifan Zhong and Siyi Hu and Haobo Fu and QIANG FU and Xiaojun Chang and Yaodong Yang},
-booktitle={The Twelfth International Conference on Learning Representations},
-year={2024},
-url={https://openreview.net/forum?id=tmqOhBC4a5}
-}
-```
+An arXiv identifier will be added after submission. Please also cite [HARL](https://jmlr.org/papers/v25/23-0488.html) and the benchmarks used in your experiments. Code attribution and licensing are preserved in [LICENSE](LICENSE); bundled third-party components retain their own notices.

@@ -416,3 +416,16 @@ tags
 [._]*.un~
 
 results/
+# Generated experiment outputs and machine-specific artifacts
+.DS_Store
+plots/
+*.egg-info/
+
+# Keep all manuscript files and experiment records outside the public repository.
+/paper/
+/results_paper/
+/analysis/
+/harl/probing_tools/
+*.tex
+*.bib
+*.bbl

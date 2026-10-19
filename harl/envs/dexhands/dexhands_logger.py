@@ -40,6 +40,7 @@ class DexHandsLogger(BaseLogger):
             )
         )
 
+
         if len(self.done_episodes_rewards) > 0:
             aver_episode_rewards = np.mean(self.done_episodes_rewards)
             print(
